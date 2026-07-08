@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#f0f2f5">
+<meta name="apple-mobile-web-app-title" content="TabKit">
+<meta name="description" content="TabKit — a free online guitar tablature editor. Create, edit, and play guitar tabs with multi-track support, SoundFont playback, MIDI export, and more. Supports guitar, bass, banjo, drums, and 12-string instruments.">
+<meta name="keywords" content="guitar tab, tablature editor, guitar tabs, tab editor, music notation, guitar software, bass tabs, banjo tabs, MIDI, SoundFont, online tab editor, free tab editor">
+<meta name="author" content="TabKit">
+<meta property="og:title" content="TabKit — Guitar Tablature Editor">
+<meta property="og:description" content="Free online guitar tablature editor with multi-track support, SoundFont playback, and MIDI export. Create and play guitar, bass, banjo, and drum tabs.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="icon-512.png">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<title>TabKit — Free Online Guitar Tablature Editor</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+<style>body{margin:0;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;-webkit-tap-highlight-color:transparent;touch-action:manipulation;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);}*{-webkit-user-select:none;user-select:none;box-sizing:border-box;}input,textarea,select{-webkit-user-select:auto;user-select:auto;background:var(--dlg-input-bg,#fff);color:var(--dlg-text,#1a1a2e);border:1px solid var(--dlg-input-border,#c0c8d8);border-radius:4px;padding:4px 6px;font-size:12px;font-family:inherit;}option{background:var(--dlg-input-bg,#fff);color:var(--dlg-text,#1a1a2e);}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" src="TabKit.jsx"></script>
+<script>
+window._pwaPromptEvent = null;
+window.addEventListener("beforeinstallprompt", function(e) {
+  e.preventDefault();
+  window._pwaPromptEvent = e;
+});
+window.addEventListener("appinstalled", function() {
+  window._pwaPromptEvent = null;
+});
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').catch(function(){});
+}
+</script>
+</body>
+</html>
