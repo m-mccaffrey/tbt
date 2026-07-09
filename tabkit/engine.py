@@ -149,11 +149,13 @@ class Player:
     def playing(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def play(self, compiled: CompiledSong, start_time: float = 0.0) -> None:
+    def play(self, compiled: CompiledSong, start_time: float = 0.0,
+             end_time: float | None = None, loop: bool = False) -> None:
         self.stop()
         self._stop.clear()
         self._thread = threading.Thread(
-            target=self._run, args=(compiled, start_time), daemon=True)
+            target=self._run, args=(compiled, start_time, end_time, loop),
+            daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -172,37 +174,53 @@ class Player:
             return False
         return True
 
-    def _run(self, compiled: CompiledSong, start_time: float) -> None:
-        events = [e for e in compiled.events if e.time >= start_time
-                  or e.kind in ("prog", "cc", "bend")]
-        ticks = [tk for tk in compiled.tick_times if tk[0] >= start_time]
-        t0 = time.perf_counter() - start_time
-        ei = ti = 0
-        while not self._stop.is_set() and (ei < len(events) or ti < len(ticks)):
-            next_t = min(events[ei].time if ei < len(events) else float("inf"),
-                         ticks[ti][0] if ti < len(ticks) else float("inf"))
-            # Coarse sleep, then spin the last 2 ms for precision
-            while True:
-                now = time.perf_counter() - t0
-                remaining = next_t - now
-                if remaining <= 0:
-                    break
-                if remaining > 0.002:
-                    if self._stop.wait(min(remaining - 0.002, 0.05)):
-                        return
-                # inside 2 ms: spin
-            while ei < len(events) and events[ei].time <= next_t:
-                ev = events[ei]
-                if self._audible(ev):
-                    self.backend.send(ev)
-                ei += 1
-            while ti < len(ticks) and ticks[ti][0] <= next_t:
-                if self.on_tick:
-                    self.on_tick(*ticks[ti])
-                ti += 1
-        if not self._stop.is_set():
-            # let the tail ring out
-            self._stop.wait(max(0.0, compiled.duration -
-                                (time.perf_counter() - t0)))
-            if self.on_finished:
-                self.on_finished()
+    def _run(self, compiled: CompiledSong, start_time: float,
+             end_time: float | None, loop: bool) -> None:
+        end = end_time if end_time is not None else compiled.duration
+        # channel state (programs/CCs/bends) from before the window still
+        # applies — replay it once so a mid-song start sounds right
+        setup = [e for e in compiled.events
+                 if e.time < start_time and e.kind in ("prog", "cc", "bend")]
+        events = [e for e in compiled.events if start_time <= e.time < end]
+        ticks = [tk for tk in compiled.tick_times if start_time <= tk[0] < end]
+        for ev in setup:
+            self.backend.send(ev)
+
+        while not self._stop.is_set():
+            t0 = time.perf_counter() - start_time
+            ei = ti = 0
+            while not self._stop.is_set() and (ei < len(events) or ti < len(ticks)):
+                next_t = min(events[ei].time if ei < len(events) else float("inf"),
+                             ticks[ti][0] if ti < len(ticks) else float("inf"))
+                # Coarse sleep, then spin the last 2 ms for precision
+                while True:
+                    now = time.perf_counter() - t0
+                    remaining = next_t - now
+                    if remaining <= 0:
+                        break
+                    if remaining > 0.002:
+                        if self._stop.wait(min(remaining - 0.002, 0.05)):
+                            return
+                    # inside 2 ms: spin
+                while ei < len(events) and events[ei].time <= next_t:
+                    ev = events[ei]
+                    if self._audible(ev):
+                        self.backend.send(ev)
+                    ei += 1
+                while ti < len(ticks) and ticks[ti][0] <= next_t:
+                    if self.on_tick:
+                        self.on_tick(*ticks[ti])
+                    ti += 1
+            if self._stop.is_set():
+                return
+            # wait out the rest of the window so the loop length is exact
+            rest = end - (time.perf_counter() - t0)
+            if self._stop.wait(max(0.0, rest)):
+                return
+            if not loop:
+                if end_time is not None:
+                    self.backend.all_off()  # region cut: silence stragglers
+                break
+            self.backend.all_off()
+        if not self._stop.is_set() and self.on_finished:
+            self.on_finished()

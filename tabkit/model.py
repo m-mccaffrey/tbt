@@ -22,6 +22,32 @@ DEFAULT_TEMPO = 120
 DEFAULT_TRACK_VELOCITY = 80
 
 
+_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def midi_note_name(midi: int) -> str:
+    """60 -> 'C4' (MIDI octave convention: C4 = 60)."""
+    return f"{_NOTE_NAMES[midi % 12]}{midi // 12 - 1}"
+
+
+def parse_note_name(text: str) -> int:
+    """'E2' -> 40; also accepts a bare MIDI number."""
+    text = text.strip().upper()
+    if text.isdigit():
+        value = int(text)
+    else:
+        for i, name in sorted(enumerate(_NOTE_NAMES), key=lambda p: -len(p[1])):
+            if text.startswith(name):
+                octave = int(text[len(name):])
+                value = (octave + 1) * 12 + i
+                break
+        else:
+            raise ValueError(f"Not a note name: {text!r}")
+    if not 0 <= value <= 127:
+        raise ValueError(f"Note out of MIDI range: {text!r}")
+    return value
+
+
 def time_sig_beats(num: int, den: int) -> int:
     """Time signature -> number of 16th-note positions per measure."""
     return round(num * (16 / den))

@@ -47,11 +47,20 @@ Reference implementation: `legacy-web/TabKit.jsx` (line numbers below).
 - [x] Metronome (quarter-note clicks, accented downbeats) + one-measure
       count-in; practice speed parameter in the compiler
 - [x] Song title/tempo dialogs, MIDI export from the GUI
-- [ ] Channel-per-string voice allocation so simultaneous bends on
-      different strings don't share one channel's pitch wheel
-- [ ] Sections strip, practice/loop mode UI (speed knob, loop region)
-- [ ] Tuning editor / drum lane editor
-- [ ] TBT / Guitar Pro import (parsers exist in JSX ~1360-2100)
+- [x] Bend channel pool: notes that bend are routed round-robin through
+      unclaimed MIDI channels (program/volume/pan mirrored, bend range
+      set via RPN), so simultaneous bends on different strings get
+      independent pitch wheels — this *exceeds* the web synth, which
+      shared one channel per track
+- [x] Loop mode (Ctrl+L): loops the selected region or the whole song,
+      with exact loop length and stragglers silenced at the wrap
+- [x] Practice speed control (25-200%) in the toolbar
+- [x] Track properties dialog: name, GM instrument, tuning editor with
+      note names (drum lanes as MIDI notes for drum tracks), capo,
+      transpose, track velocity
+- [ ] Sections strip
+- [ ] TBT import (parser exists in JSX ~1360-2100)
+      — Guitar Pro import dropped by project decision
 
 ## Phase 3 — "musician features" (the reason for going native)
 

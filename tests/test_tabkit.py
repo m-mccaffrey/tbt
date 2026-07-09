@@ -194,7 +194,7 @@ def test_bend_chain_suppresses_target():
     assert bends[-1].a == bend_value(2.0)  # arrived +2 semitones
 
 
-def test_slide_then_plain_note_recenters():
+def test_slide_uses_pool_channel_leaving_track_channel_clean():
     song = make_song(measures=1)
     b = song["tracks"][0]["measures"][0]["beats"]
     b[0]["notes"][0] = {"fret": 3, "attack": True, "effect": 92}  # slide up
@@ -203,10 +203,33 @@ def test_slide_then_plain_note_recenters():
     compiled = compile_song(song)
     ons = [e for e in compiled.events if e.kind == "on"]
     assert [e.a for e in ons] == [43, 40]
-    # the plain attack must recenter the channel bend
-    recenter = [e for e in compiled.events
-                if e.kind == "bend" and e.time == pytest.approx(1.0)]
-    assert recenter and recenter[-1].a == 8192
+    # the sliding note is routed to a free pool channel; the plain note
+    # stays on the track channel, which must never see a bend
+    slide_ch, plain_ch = ons[0].channel, ons[1].channel
+    assert slide_ch != plain_ch and plain_ch == 0
+    bend_channels = {e.channel for e in compiled.events if e.kind == "bend"}
+    assert bend_channels == {slide_ch}
+    # the pool channel mirrors the track's program before the note starts
+    progs = [e for e in compiled.events
+             if e.kind == "prog" and e.channel == slide_ch]
+    assert progs and progs[0].a == 25
+
+
+def test_simultaneous_bends_get_independent_channels():
+    song = make_song(measures=1)
+    b = song["tracks"][0]["measures"][0]["beats"]
+    b[0]["notes"][0] = {"fret": 5, "attack": True, "effect": 98}
+    b[0]["notes"][1] = {"fret": 7, "attack": True, "effect": 98}
+    b[4]["notes"][0] = make_note(7)
+    b[4]["notes"][1] = make_note(9)
+    compiled = compile_song(song)
+    ons = [e for e in compiled.events if e.kind == "on"]
+    assert len({e.channel for e in ons}) == 2
+    from tabkit.compiler import bend_value
+    for ch in {e.channel for e in ons}:
+        last = [e for e in compiled.events
+                if e.kind == "bend" and e.channel == ch][-1]
+        assert last.a == bend_value(2.0)  # each arrives at +2 semitones
 
 
 def test_hammer_on_reduces_next_velocity():

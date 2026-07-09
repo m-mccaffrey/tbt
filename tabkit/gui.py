@@ -321,12 +321,16 @@ class MainWindow(QMainWindow):
                              QKeySequence("Ctrl+M"), checkable=True)
         self.count_in_act = act(m_song, "Count-in", lambda: None,
                                 checkable=True)
+        self.loop_act = act(m_song, "Loop (selection or song)", lambda: None,
+                            QKeySequence("Ctrl+L"), checkable=True)
 
         m_track = mb.addMenu("&Track")
         for preset in TRACK_PRESETS:
             act(m_track, f"Add {preset}",
                 lambda _=False, p=preset: self.add_track(p))
         m_track.addSeparator()
+        act(m_track, "Properties…", self.track_properties,
+            QKeySequence("Ctrl+P"))
         act(m_track, "Duplicate Track", self.duplicate_track)
         act(m_track, "Rename Track…", self.rename_track)
         act(m_track, "Delete Track", self.delete_track)
@@ -338,6 +342,14 @@ class MainWindow(QMainWindow):
         self.play_act.triggered.connect(self.toggle_play)
         tb.addAction(self.play_act)
         tb.addAction(self.metro_act)
+        tb.addAction(self.loop_act)
+        from PySide6.QtWidgets import QSpinBox
+        tb.addWidget(QLabel("  Speed % "))
+        self.speed_box = QSpinBox()
+        self.speed_box.setRange(25, 200)
+        self.speed_box.setValue(100)
+        self.speed_box.setSingleStep(5)
+        tb.addWidget(self.speed_box)
         self.status = QLabel("Ready")
         self.statusBar().addWidget(self.status)
 
@@ -665,6 +677,78 @@ class MainWindow(QMainWindow):
         self._mutated()
         self.status.setText("Deleted track")
 
+    def track_properties(self) -> None:
+        """Edit name, instrument, tuning (or drum lanes), capo, transpose."""
+        from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox,
+                                       QFormLayout, QLineEdit, QSpinBox)
+
+        from .model import GM_PROGRAMS, midi_note_name, parse_note_name
+
+        c = self.view.cursor
+        trk = self.song["tracks"][c["track"]]
+        is_drum = bool(trk.get("isDrum"))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Track properties")
+        form = QFormLayout(dlg)
+        name_edit = QLineEdit(trk.get("name") or "")
+        form.addRow("Name", name_edit)
+        inst_combo = QComboBox()
+        inst_combo.addItems(GM_PROGRAMS)
+        inst_combo.setCurrentIndex(trk.get("instrument") or 0)
+        if not is_drum:
+            form.addRow("Instrument", inst_combo)
+        tuning = trk.get("tuning") or []
+        if is_drum:
+            tuning_text = ",".join(str(t) for t in tuning)
+            tuning_label = "Drum lanes (MIDI notes)"
+        else:
+            tuning_text = " ".join(midi_note_name(t) for t in tuning)
+            tuning_label = "Tuning (low→high)"
+        tuning_edit = QLineEdit(tuning_text)
+        form.addRow(tuning_label, tuning_edit)
+        capo_spin = QSpinBox()
+        capo_spin.setRange(0, 12)
+        capo_spin.setValue(trk.get("capo") or 0)
+        trans_spin = QSpinBox()
+        trans_spin.setRange(-24, 24)
+        trans_spin.setValue(trk.get("transpose") or 0)
+        vel_spin = QSpinBox()
+        vel_spin.setRange(1, 127)
+        vel_spin.setValue(trk.get("trackVelocity") or 80)
+        if not is_drum:
+            form.addRow("Capo", capo_spin)
+            form.addRow("Transpose", trans_spin)
+        form.addRow("Velocity", vel_spin)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+        try:
+            parts = tuning_edit.text().replace(",", " ").split()
+            new_tuning = [parse_note_name(p) for p in parts]
+        except ValueError as exc:
+            QMessageBox.warning(self, "TabKit", str(exc))
+            return
+        if len(new_tuning) != trk["numStrings"]:
+            QMessageBox.warning(
+                self, "TabKit",
+                f"Need {trk['numStrings']} notes, got {len(new_tuning)}")
+            return
+        self._snapshot()
+        trk["name"] = name_edit.text() or trk.get("name")
+        if not is_drum:
+            trk["instrument"] = inst_combo.currentIndex()
+            trk["capo"] = capo_spin.value()
+            trk["transpose"] = trans_spin.value()
+        trk["tuning"] = new_tuning
+        trk["trackVelocity"] = vel_spin.value()
+        self._mutated()
+        self.status.setText("Track updated")
+
     def export_midi(self) -> None:
         from .midi_export import export_midi
         path, _ = QFileDialog.getSaveFileName(
@@ -793,17 +877,28 @@ class MainWindow(QMainWindow):
         compiled = compile_song(self.song,
                                 metronome=self.metro_act.isChecked(),
                                 count_in=(self.count_in_act.isChecked()
-                                          and self.metro_act.isChecked()))
-        start = 0.0
-        c = self.view.cursor
-        if from_cursor and c:
-            mm = self.view.meas_map
-            flat = mm[c["measure"]]["start"] + c["beat"] if c["measure"] < len(mm) else 0
+                                          and self.metro_act.isChecked()),
+                                speed=self.speed_box.value() / 100)
+        mm = self.view.meas_map
+
+        def time_at(flat: int, after: float = -1.0) -> float | None:
             for t, mi, bi in compiled.tick_times:
-                if mm[mi]["start"] + bi >= flat:
-                    start = t
-                    break
-        self.player.play(compiled, start_time=start)
+                if t > after and mm[mi]["start"] + bi >= flat:
+                    return t
+            return None
+
+        start, end = 0.0, None
+        loop = self.loop_act.isChecked()
+        rng = self.view.sel_range()
+        c = self.view.cursor
+        if loop and rng:
+            # loop the selected region (first pass through it)
+            (smi, sbi), (emi, ebi) = rng
+            start = time_at(mm[smi]["start"] + sbi) or 0.0
+            end = time_at(mm[emi]["start"] + ebi + 1, after=start)
+        elif from_cursor and c and c["measure"] < len(mm):
+            start = time_at(mm[c["measure"]]["start"] + c["beat"]) or 0.0
+        self.player.play(compiled, start_time=start, end_time=end, loop=loop)
         self.play_act.setText("Stop")
 
     def _on_tick(self, _time: float, measure: int, beat: int) -> None:

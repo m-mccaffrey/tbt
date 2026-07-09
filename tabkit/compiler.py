@@ -130,9 +130,11 @@ class _TrackState:
         self.bank = track.get("bank") or 0
         self.let_ring = bool(track.get("letRing"))
         self.track_velocity = track.get("trackVelocity") or DEFAULT_TRACK_VELOCITY
-        # sounding notes per string: string -> list of MIDI pitches (main +
-        # doubled/shimmer voices); ring flag per string
-        self.active: dict[int, list[int]] = {}
+        self.volume = track.get("volume")
+        self.pan = track.get("pan")
+        # sounding notes per string: string -> list of (channel, pitch)
+        # voices (main + doubled/shimmer copies); ring flag per string
+        self.active: dict[int, list[tuple[int, int]]] = {}
         self.ring: set[int] = set()
         # bend/technique state (mirrors bendState/suppressNext/hammerNext)
         self.bend: dict[int, float] = {}      # semitone offset per string
@@ -184,6 +186,34 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
     any_solo = any(t.get("solo") for t in tracks)
     states = {ti: _TrackState(tracks[ti]) for ti in play_tracks}
 
+    # Bend channel pool: MIDI pitch bend is per-channel, so notes that
+    # will bend are routed round-robin through channels no track claims.
+    # Simultaneous bends on different strings then get their own wheels.
+    _claimed = {t.get("midiChannel", i) for i, t in enumerate(tracks)}
+    _claimed.add(CLICK_CHANNEL)
+    bend_pool = [c for c in range(16) if c not in _claimed]
+    _pool_state = {"idx": 0, "ready": set()}
+
+    def alloc_bend_channel(ti: int, time: float) -> int | None:
+        if not bend_pool:
+            return None
+        ch = bend_pool[_pool_state["idx"] % len(bend_pool)]
+        _pool_state["idx"] += 1
+        st = states[ti]
+        if ch not in _pool_state["ready"]:
+            _pool_state["ready"].add(ch)
+            for cc, val in ((101, 0), (100, 0), (6, BEND_RANGE_SEMITONES),
+                            (38, 0)):
+                emit(0.0, "cc", ch, cc, val, track=ti)
+        # mirror the track's current sound onto the pool channel
+        emit(time, "prog", ch, st.instrument, st.bank, track=ti)
+        if st.volume is not None:
+            emit(time, "cc", ch, 7, max(0, min(127, st.volume)), track=ti)
+        if st.pan is not None:
+            emit(time, "cc", ch, 10, max(0, min(127, st.pan)), track=ti)
+        emit_bend(time, ch, 0.0, ti, force=True)
+        return ch
+
     # Last pitch-bend value emitted per channel (bends are per-channel in
     # MIDI, per-voice in the web synth — see note on emit_bend below)
     chan_bend: dict[int, int] = {}
@@ -233,8 +263,8 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
 
     def kill_string(ti: int, ch: int, si: int, time: float) -> None:
         st = states[ti]
-        for midi in st.active.pop(si, []):
-            emit(time, "off", ch, midi, track=ti)
+        for v_ch, v_midi in st.active.pop(si, []):
+            emit(time, "off", v_ch, v_midi, track=ti)
         st.ring.discard(si)
 
     def click(time: float, accent: bool) -> None:
@@ -315,6 +345,10 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                             if ft in _CC_EFFECTS:
                                 emit(bt, "cc", ch, _CC_EFFECTS[ft],
                                      max(0, min(127, fv)), track=ti)
+                                if ft == 86:
+                                    st.volume = fv
+                                elif ft == 80:
+                                    st.pan = fv
                             elif ft == 73:
                                 st.instrument = fv & 0x7F
                                 emit(bt, "prog", ch, st.instrument, st.bank, track=ti)
@@ -361,9 +395,36 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                             if (not n or not n.get("attack")) and ks not in st.ring:
                                 kill_string(ti, ch, ks, bt)
 
-                    def run_chain(si: int, source_midi: int, from_mi: int,
-                                  from_bi: int, start_time: float,
-                                  start_semi: float, is_bend: bool) -> None:
+                    def will_bend(si: int, n: dict) -> bool:
+                        """True if this attack will emit pitch bends —
+                        by its own effect, or a later technique-only
+                        marker before the next attack on the string."""
+                        fx = n.get("effect")
+                        if fx in _CHAIN_FX or fx == FX_VIBRATO:
+                            return True
+                        if fx == FX_RELEASE and st.bend.get(si):
+                            return True
+                        s_mi, s_bi = mi, wi
+                        while True:
+                            s_bi += 1
+                            if s_bi >= len(trk["measures"][s_mi]["beats"]):
+                                s_mi, s_bi = s_mi + 1, 0
+                                if s_mi >= len(trk["measures"]):
+                                    return False
+                            nn = (trk["measures"][s_mi]["beats"][s_bi]
+                                  .get("notes") or [None] * 16)
+                            nn = nn[si] if si < len(nn) else None
+                            if not nn:
+                                continue
+                            if nn.get("attack"):
+                                return False
+                            if nn.get("techniqueOnly") or nn.get("vibratoOnly"):
+                                return True
+
+                    def run_chain(note_ch: int, si: int, source_midi: int,
+                                  from_mi: int, from_bi: int,
+                                  start_time: float, start_semi: float,
+                                  is_bend: bool) -> None:
                         """Bend/slide chain scan (TabKit.jsx 10064-10105):
                         ramp through successive notes on the string,
                         suppressing their attacks."""
@@ -378,7 +439,7 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                             prev_time = chain_time
                             chain_time += nxt["beats"] * spb
                             emit_ramp(prev_time, chain_semi, chain_time,
-                                      ramp_semi, ch, ti)
+                                      ramp_semi, note_ch, ti)
                             chain_semi = ramp_semi
                             st.bend[si] = ramp_semi
                             st.suppress[si] = st.suppress.get(si, 0) + 1
@@ -389,7 +450,7 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                             if not c_n:
                                 break
                             if is_bend and c_n.get("effect") == FX_VIBRATO:
-                                emit_vibrato(chain_time, ramp_semi, ch, ti)
+                                emit_vibrato(chain_time, ramp_semi, note_ch, ti)
                             if c_n.get("effect") in (FX_RELEASE, *_CHAIN_FX):
                                 continue
                             if c_n.get("bendHold"):
@@ -405,19 +466,19 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                             if (not (n.get("techniqueOnly") or n.get("vibratoOnly"))
                                     or si not in st.active or is_drum):
                                 continue
-                            active_midi = st.active[si][0]
+                            a_ch, active_midi = st.active[si][0]
                             fx = n.get("effect")
                             if fx == FX_VIBRATO and not st.suppress.get(si, 0):
-                                emit_vibrato(bt, st.bend.get(si, 0.0), ch, ti)
+                                emit_vibrato(bt, st.bend.get(si, 0.0), a_ch, ti)
                             elif fx in _CHAIN_FX:
-                                run_chain(si, active_midi, mi, wi, bt,
+                                run_chain(a_ch, si, active_midi, mi, wi, bt,
                                           st.bend.get(si, 0.0), fx == FX_BEND)
                             elif fx == FX_RELEASE and st.bend.get(si):
                                 nxt = find_next_note(trk, mi, wi, si)
                                 if nxt:
                                     emit_ramp(bt, st.bend[si],
                                               bt + nxt["beats"] * spb,
-                                              nxt["midi"] - active_midi, ch, ti)
+                                              nxt["midi"] - active_midi, a_ch, ti)
                                     st.suppress[si] = st.suppress.get(si, 0) + 1
                                 st.bend[si] = 0.0
                             continue
@@ -462,33 +523,39 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                         play_vel = max(0, round(harm_vel * dry))
                         pm_dur = beat_dur * 0.3 if n.get("effect") == FX_PALM_MUTE else 0.0
 
-                        # Bends are per-channel in MIDI: recenter before a
-                        # fresh attack if this channel has bent (per-string
-                        # channel allocation is a Phase 3 refinement)
-                        if not is_drum and ch in chan_bend:
+                        # Notes that will bend get a channel from the pool
+                        # so simultaneous bends have independent wheels
+                        note_ch = ch
+                        if not is_drum and will_bend(si, n):
+                            pool_ch = alloc_bend_channel(ti, bt)
+                            if pool_ch is not None:
+                                note_ch = pool_ch
+                        # recenter before a fresh attack on a bent channel
+                        if not is_drum and note_ch == ch and ch in chan_bend:
                             emit_bend(bt, ch, 0.0, ti, force=True)
 
                         sounding = []
                         if play_vel > 0:
-                            sounding.append(midi)
-                            emit(bt, "on", ch, midi, min(127, play_vel),
+                            sounding.append((note_ch, midi))
+                            emit(bt, "on", note_ch, midi, min(127, play_vel),
                                  ti, mi, bi)
                             if pm_dur and not is_drum:
-                                emit(bt + pm_dur, "off", ch, midi, track=ti)
-                                sounding.remove(midi)
+                                emit(bt + pm_dur, "off", note_ch, midi, track=ti)
+                                sounding.remove((note_ch, midi))
                         if is_harm:
                             shim = min(127, midi + 12)
-                            emit(bt, "on", ch, shim, round(vel * 0.5), ti, mi, bi)
-                            sounding.append(shim)
+                            emit(bt, "on", note_ch, shim, round(vel * 0.5),
+                                 ti, mi, bi)
+                            sounding.append((note_ch, shim))
                         if trk.get("twelveStringMode") and not is_drum:
                             oct12 = 12 if si < trk["numStrings"] - 2 else 0
                             dbl = min(127, midi + oct12)
-                            emit(bt, "on", ch, dbl, round(play_vel * 0.9),
+                            emit(bt, "on", note_ch, dbl, round(play_vel * 0.9),
                                  ti, mi, bi)
                             if pm_dur:
-                                emit(bt + pm_dur, "off", ch, dbl, track=ti)
+                                emit(bt + pm_dur, "off", note_ch, dbl, track=ti)
                             else:
-                                sounding.append(dbl)
+                                sounding.append((note_ch, dbl))
 
                         # Pedal effects (TabKit.jsx 10001-10052)
                         if not is_drum and play_vel > 0:
@@ -498,15 +565,15 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                                 adt_dl = (8 + round(ped["adt"] * 0.35)) / 1000
                                 adt_vol = round(play_vel *
                                                 (0.6 + ped["adt"] / 200))
-                                emit(bt + adt_dl, "on", ch, midi,
+                                emit(bt + adt_dl, "on", note_ch, midi,
                                      max(1, min(127, adt_vol)), ti, mi, bi)
                             if ped["octOn"]:
                                 ps_note = max(0, min(127, midi + (ped["octShift"] or -12)))
                                 ps_vel = round(harm_vel * ped["octMix"] / 100)
                                 if ps_vel > 0:
-                                    emit(bt, "on", ch, ps_note, min(127, ps_vel),
-                                         ti, mi, bi)
-                                    sounding.append(ps_note)
+                                    emit(bt, "on", note_ch, ps_note,
+                                         min(127, ps_vel), ti, mi, bi)
+                                    sounding.append((note_ch, ps_note))
                             if ped["delayOn"]:
                                 # echo taps decaying by mix% each repeat
                                 tap_dt = get_delay_seconds(
@@ -517,9 +584,10 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                                     if tv < 3:
                                         break
                                     tt = bt + tap_dt * tap
-                                    emit(tt, "on", ch, midi, round(tv), ti, mi, bi)
-                                    emit(tt + tap_dt * 0.9, "off", ch, midi,
-                                         track=ti)
+                                    emit(tt, "on", note_ch, midi, round(tv),
+                                         ti, mi, bi)
+                                    emit(tt + tap_dt * 0.9, "off", note_ch,
+                                         midi, track=ti)
                             if ped["tremOn"]:
                                 # expression LFO for 3 s (scheduleTremolo)
                                 hz = tremolo_hz(ped["tremSpeed"],
@@ -537,8 +605,9 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                         if is_drum:
                             for group in DRUM_CHOKE_GROUPS:
                                 if midi in group:
-                                    for csi, pitches in list(st.active.items()):
-                                        if csi != si and any(p in group for p in pitches):
+                                    for csi, voices in list(st.active.items()):
+                                        if csi != si and any(p in group
+                                                             for _, p in voices):
                                             kill_string(ti, ch, csi, bt)
 
                         st.active[si] = sounding
@@ -557,15 +626,16 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                         fx = n.get("effect")
                         if not is_drum and fx:
                             if fx == FX_VIBRATO:
-                                emit_vibrato(bt, st.bend.get(si, 0.0), ch, ti)
+                                emit_vibrato(bt, st.bend.get(si, 0.0),
+                                             note_ch, ti)
                             if fx in _CHAIN_FX:
-                                run_chain(si, midi, mi, wi, bt, 0.0,
+                                run_chain(note_ch, si, midi, mi, wi, bt, 0.0,
                                           fx == FX_BEND)
                             if fx == FX_RELEASE and st.bend.get(si):
                                 nxt = find_next_note(trk, mi, wi, si)
                                 if nxt:
                                     emit_ramp(bt, 0.0, bt + nxt["beats"] * spb,
-                                              nxt["midi"] - midi, ch, ti)
+                                              nxt["midi"] - midi, note_ch, ti)
                                     st.suppress[si] = st.suppress.get(si, 0) + 1
                                 st.bend[si] = 0.0
                             if fx in (FX_HAMMER, FX_PULL_OFF):
