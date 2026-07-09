@@ -46,10 +46,13 @@ def dumps_tkt(song: Song) -> bytes:
 
 
 def load(path: str | Path) -> Song:
-    """Load a song from a .tkt or plain-JSON file."""
+    """Load a song from a .tkt, .tbt (TabIt), or plain-JSON file."""
     data = Path(path).read_bytes()
     if is_tkt(data):
         return loads_tkt(data)
+    if data[:3] == b"TBT":
+        from .tbtfile import load_tbt
+        return load_tbt(data)
     return json.loads(data.decode("utf-8"))
 
 

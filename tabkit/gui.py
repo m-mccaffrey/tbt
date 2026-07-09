@@ -59,9 +59,10 @@ def empty_measure(num_strings: int, n_beats: int = 16,
 
 
 def new_song() -> dict:
+    # midiChannel follows the web app's 1-based convention (drums = 10)
     return {"title": "Untitled", "tempo": 120, "tracks": [{
         "name": "Guitar", "numStrings": 6, "tuning": [40, 45, 50, 55, 59, 64],
-        "instrument": 25, "midiChannel": 0,
+        "instrument": 25, "midiChannel": 1,
         "measures": [empty_measure(6) for _ in range(4)],
     }]}
 
@@ -135,6 +136,25 @@ class TabView(QWidget):
         if not self.song:
             return
         x, y = event.position().x(), event.position().y()
+        if y < 24:  # sections strip: click selects the section's bars
+            from .model import section_at
+            for mi, info in enumerate(self.meas_map):
+                mx = LEFT_PAD + info["start"] * BEAT_W
+                if mx <= x < mx + info["beats"] * BEAT_W:
+                    sec = section_at(self.song, mi)
+                    if sec and self.cursor:
+                        end_bar = min(sec["bar"] + (sec.get("bars") or 1) - 1,
+                                      len(self.meas_map) - 1)
+                        self.cursor.update({"measure": sec["bar"], "beat": 0})
+                        self.clamp_cursor()
+                        last_beats = len(self.song["tracks"][self.cursor["track"]]
+                                         ["measures"][end_bar]["beats"])
+                        self.sel = {"track": self.cursor["track"],
+                                    "start": (sec["bar"], 0),
+                                    "end": (end_bar, last_beats - 1)}
+                        self.update()
+                    return
+            return
         for ti, top in enumerate(self.track_tops):
             trk = self.song["tracks"][ti]
             if not top <= y < top + trk["numStrings"] * STRING_H:
@@ -185,6 +205,21 @@ class TabView(QWidget):
         bar_pen = QPen(QColor("#59617a"), 2)
         note_font = QFont("monospace", 9)
         label_font = QFont("sans-serif", 9, QFont.Bold)
+
+        # sections strip above the first track
+        for sec in self.song.get("sections") or []:
+            if sec["bar"] >= len(self.meas_map):
+                continue
+            sx = LEFT_PAD + self.meas_map[sec["bar"]]["start"] * BEAT_W
+            end_bar = min(sec["bar"] + (sec.get("bars") or 1),
+                          len(self.meas_map)) - 1
+            ex = LEFT_PAD + (self.meas_map[end_bar]["start"]
+                             + self.meas_map[end_bar]["beats"]) * BEAT_W
+            color = QColor(sec.get("color") or "#3b82f6")
+            p.fillRect(int(sx), 4, int(ex - sx) - 2, 16, color)
+            p.setFont(label_font)
+            p.setPen(QColor("#ffffff"))
+            p.drawText(int(sx) + 4, 16, sec.get("name") or "")
 
         for ti, trk in enumerate(self.song["tracks"]):
             y = self.track_tops[ti]
@@ -323,6 +358,10 @@ class MainWindow(QMainWindow):
                                 checkable=True)
         self.loop_act = act(m_song, "Loop (selection or song)", lambda: None,
                             QKeySequence("Ctrl+L"), checkable=True)
+        m_song.addSeparator()
+        act(m_song, "Add/Edit Section…", self.edit_section,
+            QKeySequence("Ctrl+E"))
+        act(m_song, "Remove Section", self.remove_section)
 
         m_track = mb.addMenu("&Track")
         for preset in TRACK_PRESETS:
@@ -493,7 +532,8 @@ class MainWindow(QMainWindow):
         from .model import note_midi
         c = self.view.cursor
         trk = self.song["tracks"][c["track"]]
-        ch = trk.get("midiChannel", c["track"])
+        from .model import track_channel
+        ch = track_channel(trk, c["track"])
         midi = note_midi(trk, c["string"], fret)
         vel = trk.get("trackVelocity") or 80
         backend.send(Event(0, "prog", ch, trk.get("instrument") or 0,
@@ -524,6 +564,8 @@ class MainWindow(QMainWindow):
                 "globalBeatsPerMeasure": n_beats,
                 "timeSig": {"num": ts["num"], "den": ts["den"]},
             })
+        from .model import shift_sections
+        shift_sections(self.song, c["measure"], 1)
         self._mutated()
         self.status.setText("Inserted bar")
 
@@ -536,6 +578,8 @@ class MainWindow(QMainWindow):
         for trk in self.song["tracks"]:
             if c["measure"] < len(trk["measures"]):
                 trk["measures"].pop(c["measure"])
+        from .model import shift_sections
+        shift_sections(self.song, c["measure"], -1)
         self._mutated()
         self.status.setText("Deleted bar")
 
@@ -615,15 +659,57 @@ class MainWindow(QMainWindow):
             self.song["tempo"] = val
             self._mutated()
 
+    def edit_section(self) -> None:
+        """Add a section at the cursor bar (or rename the existing one).
+        A selection sets the section's bar span."""
+        from PySide6.QtWidgets import QInputDialog
+
+        from .model import SECTION_COLORS, section_at
+        c = self.view.cursor
+        rng = self.view.sel_range()
+        bar = rng[0][0] if rng else c["measure"]
+        bars = (rng[1][0] - rng[0][0] + 1) if rng else 1
+        existing = section_at(self.song, bar)
+        name, ok = QInputDialog.getText(
+            self, "Section", "Name (e.g. Verse, Chorus):",
+            text=existing.get("name", "") if existing else "")
+        if not ok or not name:
+            return
+        self._snapshot()
+        if existing:
+            existing["name"] = name
+            if rng:
+                existing["bar"], existing["bars"] = bar, bars
+        else:
+            sections = self.song.setdefault("sections", [])
+            sections.append({
+                "bar": bar, "bars": bars, "name": name,
+                "color": SECTION_COLORS[len(sections) % len(SECTION_COLORS)]})
+            sections.sort(key=lambda s: s["bar"])
+        self._mutated()
+        self.status.setText(f"Section '{name}' at bar {bar + 1}")
+
+    def remove_section(self) -> None:
+        from .model import section_at
+        sec = section_at(self.song, self.view.cursor["measure"])
+        if not sec:
+            self.status.setText("No section at cursor")
+            return
+        self._snapshot()
+        self.song["sections"].remove(sec)
+        self._mutated()
+        self.status.setText(f"Removed section '{sec.get('name', '')}'")
+
     def _free_channel(self, drums: bool) -> int:
+        """1-based channel like the web app; drums always get 10."""
         if drums:
-            return 9
-        used = {t.get("midiChannel", i)
+            return 10
+        used = {t.get("midiChannel") or i + 1
                 for i, t in enumerate(self.song["tracks"])}
-        for ch in range(16):
-            if ch != 9 and ch not in used:
+        for ch in range(1, 17):
+            if ch != 10 and ch not in used:
                 return ch
-        return 0
+        return 1
 
     def add_track(self, preset_name: str) -> None:
         preset = TRACK_PRESETS[preset_name]
@@ -862,7 +948,8 @@ class MainWindow(QMainWindow):
                 self, "_pending_tick", ("done", 0))
         for i, trk in enumerate(self.song["tracks"]):
             if trk.get("isDrum"):
-                self.backend.set_drum_channel(trk.get("midiChannel", i))
+                from .model import track_channel
+                self.backend.set_drum_channel(track_channel(trk, i))
         return self.backend
 
     def toggle_play(self, from_cursor: bool = False) -> None:

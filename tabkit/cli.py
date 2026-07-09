@@ -14,7 +14,7 @@ import sys
 
 from . import tktfile
 from .compiler import compile_song
-from .model import GM_PROGRAMS, build_measure_map
+from .model import GM_PROGRAMS, build_measure_map, track_channel
 
 
 def cmd_info(args: argparse.Namespace) -> int:
@@ -29,12 +29,13 @@ def cmd_info(args: argparse.Namespace) -> int:
         kind = "drums" if trk.get("isDrum") else \
             GM_PROGRAMS[trk.get("instrument") or 0]
         print(f"  [{i}] {trk.get('name', 'Track')} — {trk.get('numStrings')} "
-              f"strings, ch {trk.get('midiChannel', i)}, {kind}")
+              f"strings, ch {track_channel(trk, i) + 1}, {kind}")
     return 0
 
 
 def cmd_play(args: argparse.Namespace) -> int:
     from .engine import FluidSynthBackend, MidiOutBackend, Player
+    from .model import track_channel
 
     song = tktfile.load(args.file)
     compiled = compile_song(song, solo_track=args.track)
@@ -46,7 +47,7 @@ def cmd_play(args: argparse.Namespace) -> int:
         backend = FluidSynthBackend(sf2=args.sf2)
         for i, trk in enumerate(song["tracks"]):
             if trk.get("isDrum"):
-                backend.set_drum_channel(trk.get("midiChannel", i))
+                backend.set_drum_channel(track_channel(trk, i))
 
     player = Player(backend)
     done = __import__("threading").Event()

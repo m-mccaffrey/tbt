@@ -125,6 +125,53 @@ def playback_order(meas_map: list[dict[str, Any]]) -> list[int]:
     return order
 
 
+SECTION_COLORS = ["#3b82f6", "#22c55e", "#f97316", "#a855f7",
+                  "#ef4444", "#14b8a6", "#ec4899", "#eab308"]
+SECTION_PRESETS = ["Intro", "Verse", "Pre-Chorus", "Chorus", "Bridge",
+                   "Solo", "Interlude", "Breakdown", "Outro"]
+
+
+def shift_sections(song: dict[str, Any], at_bar: int, delta: int) -> None:
+    """Keep section ranges consistent when bars are inserted/deleted
+    (port of TabKit.jsx shiftSections)."""
+    if not song.get("sections"):
+        return
+    max_bar = len(song["tracks"][0]["measures"]) - 1 if song["tracks"] else 0
+    for sec in song["sections"]:
+        sec_end = sec["bar"] + (sec.get("bars") or 1)
+        if delta > 0:
+            if sec["bar"] <= at_bar < sec_end:
+                sec["bars"] = (sec.get("bars") or 1) + delta
+            elif at_bar <= sec["bar"]:
+                sec["bar"] += delta
+        else:
+            if sec["bar"] <= at_bar < sec_end:
+                sec["bars"] = max(1, (sec.get("bars") or 1) + delta)
+            elif at_bar < sec["bar"]:
+                sec["bar"] = max(0, sec["bar"] + delta)
+    song["sections"] = [s for s in song["sections"] if s["bar"] <= max_bar]
+
+
+def section_at(song: dict[str, Any], bar: int) -> dict[str, Any] | None:
+    for sec in song.get("sections") or []:
+        if sec["bar"] <= bar < sec["bar"] + (sec.get("bars") or 1):
+            return sec
+    return None
+
+
+def track_channel(track: dict[str, Any], track_idx: int) -> int:
+    """0-based MIDI channel for a track.
+
+    The web app stores 1-based channels (drums = 10) and subtracts one
+    on MIDI export; 0 or missing means auto-assign. Mirror that here,
+    also accepting already-0-based values for songs built by this port.
+    """
+    ch = track.get("midiChannel")
+    if not ch:  # 0/None: drums to GM percussion, else track index
+        return 9 if track.get("isDrum") else track_idx % 16
+    return (ch - 1) % 16
+
+
 def note_midi(track: dict[str, Any], string_idx: int, fret: int) -> int:
     """MIDI pitch for a fretted note (TabKit.jsx line 9984)."""
     tuning = track.get("tuning") or []

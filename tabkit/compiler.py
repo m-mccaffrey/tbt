@@ -24,6 +24,7 @@ from .model import (
     harmonic_midi,
     note_midi,
     playback_order,
+    track_channel,
 )
 
 # trkEffect type codes -> MIDI CC numbers (TabKit.jsx applyFx)
@@ -189,7 +190,7 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
     # Bend channel pool: MIDI pitch bend is per-channel, so notes that
     # will bend are routed round-robin through channels no track claims.
     # Simultaneous bends on different strings then get their own wheels.
-    _claimed = {t.get("midiChannel", i) for i, t in enumerate(tracks)}
+    _claimed = {track_channel(t, i) for i, t in enumerate(tracks)}
     _claimed.add(CLICK_CHANNEL)
     bend_pool = [c for c in range(16) if c not in _claimed]
     _pool_state = {"idx": 0, "ready": set()}
@@ -248,7 +249,7 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
     for ti in play_tracks:
         trk = tracks[ti]
         st = states[ti]
-        ch = trk.get("midiChannel", ti)
+        ch = track_channel(trk, ti)
         emit(0.0, "prog", ch, st.instrument, st.bank, track=ti)
         if not trk.get("isDrum"):
             # RPN 0,0: widen pitch-bend range so bends/slides fit
@@ -317,7 +318,7 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                 if mi >= len(trk["measures"]):
                     continue
                 measure = trk["measures"][mi]
-                ch = trk.get("midiChannel", ti)
+                ch = track_channel(trk, ti)
                 is_drum = bool(trk.get("isDrum"))
                 matches = _match_positions(measure, bi, spb)
 
@@ -651,7 +652,7 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
     # Release everything at the end
     for ti in play_tracks:
         trk = tracks[ti]
-        ch = trk.get("midiChannel", ti)
+        ch = track_channel(trk, ti)
         for si in list(states[ti].active):
             kill_string(ti, ch, si, t)
 

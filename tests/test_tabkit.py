@@ -294,3 +294,71 @@ def test_practice_speed_scales_times():
     slow = compile_song(song, speed=0.5)
     on = [e for e in slow.events if e.kind == "on"][0]
     assert on.time == pytest.approx(2.0)  # 1.0s at full speed
+
+
+def _build_tbt(repeat_count=3):
+    """Synthesize a minimal TabIt v'r' file: 1 track, 2 measures,
+    fret-3 note at beat 0, repeatEnd on measure 2."""
+    import struct
+    import zlib
+    hdr = bytearray(64)
+    hdr[0:3] = b"TBT"
+    hdr[3] = 0x72
+    hdr[5] = 1
+    hdr[34:36] = struct.pack("<H", 140)
+    hdr[40:42] = struct.pack("<H", 2)
+    b1 = bytearray()
+    b1 += struct.pack("<I", 32)          # 32 note positions
+    b1 += bytes([6, 25 | 0x80, 96, 100, 0])  # strings, inst, vol, pan, mod
+    b1 += struct.pack("<h", 0)           # pitch bend
+    b1 += bytes([0, 0, 0, 0, 64, 0, 1, 0, 0, 0])
+    b1 += bytes([0] * 8) + bytes([0])    # tuning offsets + pad
+    b2 = bytearray()
+    b2 += struct.pack("<iBB", 16, 0, 0)
+    b2 += struct.pack("<iBB", 16, 4, repeat_count)
+    pairs = bytes([1, 131, 255, 0, 255, 0, 129, 0])  # RLE: note then zeros
+    b2 += struct.pack("<H", len(pairs) // 2) + pairs
+    b2 += struct.pack("<I", 0) + struct.pack("<I", 0)
+    c1 = zlib.compress(bytes(b1))
+    hdr[48:52] = struct.pack("<I", len(c1))
+    return bytes(hdr) + c1 + zlib.compress(bytes(b2))
+
+
+def test_tbt_loader_full_pipeline():
+    from tabkit.model import track_channel
+    from tabkit.tbtfile import load_tbt
+    song = load_tbt(_build_tbt())
+    trk = song["tracks"][0]
+    assert song["tempo"] == 140
+    assert trk["midiChannel"] == 1 and not trk["letRing"]
+    assert trk["tuning"] == STD6
+    assert track_channel(trk, 0) == 0  # web channels are 1-based
+    m0, m1 = trk["measures"]
+    assert m0["beats"][0]["notes"][0] == {"fret": 3, "attack": True, "effect": 0}
+    assert m1["barLine"] == "repeatEnd" and m1["repeatCount"] == 3
+    compiled = compile_song(song)
+    ons = [e for e in compiled.events if e.kind == "on"]
+    # implicit repeat start at song beginning: 0,1 plays three times
+    assert len(ons) == 3 and all(e.a == 43 and e.channel == 0 for e in ons)
+    assert len(compiled.tick_times) == 96
+
+
+def test_drum_channel_normalization():
+    from tabkit.model import track_channel
+    assert track_channel({"midiChannel": 10, "isDrum": True}, 3) == 9
+    assert track_channel({"midiChannel": 1}, 5) == 0
+    assert track_channel({"isDrum": True}, 5) == 9  # auto-assign
+    assert track_channel({}, 5) == 5
+
+
+def test_shift_sections():
+    from tabkit.model import shift_sections
+    song = make_song(measures=6)
+    song["sections"] = [{"bar": 1, "bars": 2, "name": "Verse"},
+                        {"bar": 4, "bars": 1, "name": "Chorus"}]
+    shift_sections(song, 2, 1)  # insert a bar inside Verse
+    assert song["sections"][0] == {"bar": 1, "bars": 3, "name": "Verse"}
+    assert song["sections"][1]["bar"] == 5
+    shift_sections(song, 0, -1)  # delete the first bar
+    assert song["sections"][0]["bar"] == 0
+    assert song["sections"][1]["bar"] == 4

@@ -29,7 +29,7 @@ tabkit gui [song.tkt]         # desktop app
 ```
 
 `.tkt` files saved by the web app load directly, and files saved here
-open in the web app.
+open in the web app. TabIt `.tbt` files import too (read-only).
 
 ## Tests
 

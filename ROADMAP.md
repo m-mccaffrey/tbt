@@ -22,7 +22,7 @@ Reference implementation: `legacy-web/TabKit.jsx` (line numbers below).
 - [x] CLI: `tabkit info | play | export | gui`
 - [x] GUI skeleton: open song, render all tracks as tab, play/stop, playhead
 
-## Phase 2 — editor parity (in progress)
+## Phase 2 — editor parity (complete)
 
 - [x] Note entry/edit: cursor (click + arrows, crosses tracks), fret
       typing with two-digit combining, delete, note preview on entry
@@ -58,8 +58,15 @@ Reference implementation: `legacy-web/TabKit.jsx` (line numbers below).
 - [x] Track properties dialog: name, GM instrument, tuning editor with
       note names (drum lanes as MIDI notes for drum tracks), capo,
       transpose, track velocity
-- [ ] Sections strip
-- [ ] TBT import (parser exists in JSX ~1360-2100)
+- [x] Sections strip: colored labels above the grid, click to select a
+      section's bars, add/edit (Ctrl+E) and remove from the Song menu,
+      ranges stay consistent through bar inserts/deletes
+- [x] TBT (TabIt) import: full binary loader — versions 'e'-'r', RLE
+      note data, tuplet streams, both track-effect stream formats,
+      repeat/double barlines, tunings, metadata
+- [x] MIDI channel convention fix: the web app stores 1-based channels
+      (drums = 10); track_channel() normalizes everywhere so web-saved
+      .tkt files play on correct channels
       — Guitar Pro import dropped by project decision
 
 ## Phase 3 — "musician features" (the reason for going native)
