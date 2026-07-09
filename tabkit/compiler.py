@@ -20,6 +20,7 @@ from .model import (
     DRUM_CHOKE_GROUPS,
     build_measure_map,
     find_next_note,
+    get_time_sig,
     harmonic_midi,
     note_midi,
     playback_order,
@@ -50,6 +51,24 @@ BEND_STEP_SEC = 0.015
 VIB_CENTS = 35
 VIB_RATE_HZ = 6.0
 VIB_DURATION = 3.0
+
+# Metronome clicks: GM wood blocks on the percussion channel
+CLICK_CHANNEL = 9
+CLICK_HI = 76   # accented downbeat
+CLICK_LO = 77
+CLICK_TRACK = -2  # marker so live mute/solo never drops clicks
+
+
+def get_delay_seconds(delay_time: str, tempo: float) -> float:
+    """Echo tap interval (TabKit.jsx getDelayMs)."""
+    beat = 60.0 / (tempo or 120)
+    return {"4": beat, "8": beat / 2, "8d": beat * 0.75,
+            "16": beat / 4, "slap": 0.08}.get(delay_time, beat * 0.75)
+
+
+def tremolo_hz(speed: str, tempo: float) -> float:
+    bpm = tempo or 120
+    return {"4": bpm / 60, "8": bpm / 30, "8t": bpm / 20}.get(speed, bpm / 15)
 
 
 def bend_value(semitones: float) -> int:
@@ -119,20 +138,37 @@ class _TrackState:
         self.bend: dict[int, float] = {}      # semitone offset per string
         self.suppress: dict[int, int] = {}    # skip N chained attacks
         self.hammer: set[int] = set()         # next attack at 90% velocity
+        # pedal effect state, seeded from the track, updated by fx 201-205
+        self.pedal = {
+            "delayOn": bool(track.get("delayOn")),
+            "delayTime": track.get("delayTime") or "8d",
+            "delayTaps": track.get("delayTaps") or 3,
+            "delayMix": track.get("delayMix") or 50,
+            "octOn": bool(track.get("octOn")),
+            "octShift": track.get("octShift") or -12,
+            "octDry": track.get("octDry") if track.get("octDry") is not None else 100,
+            "octMix": track.get("octMix") or 50,
+            "tremOn": bool(track.get("tremOn")),
+            "tremSpeed": track.get("tremSpeed") or "8",
+            "tremDepth": track.get("tremDepth") or 70,
+            "adt": track.get("adt") or 0,
+        }
 
 
 def compile_song(song: dict[str, Any], solo_track: int | None = None,
-                 tail: float = 1.5) -> CompiledSong:
+                 tail: float = 1.5, metronome: bool = False,
+                 count_in: bool = False, speed: float = 1.0) -> CompiledSong:
     """Flatten a song dict into a CompiledSong.
 
     solo_track limits compilation to one track (the web app's
     single-track play mode). Static mute/solo flags on tracks are
     honored here; live toggling during playback is the engine's job.
+    speed scales the whole song's tempo (practice mode).
     """
     tracks = song["tracks"]
     meas_map = build_measure_map(song)
     order = playback_order(meas_map)
-    tempo = song.get("tempo") or DEFAULT_TEMPO
+    tempo = (song.get("tempo") or DEFAULT_TEMPO) * speed
     spb = 60.0 / tempo / 4.0
 
     out = CompiledSong()
@@ -201,11 +237,32 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
             emit(time, "off", ch, midi, track=ti)
         st.ring.discard(si)
 
+    def click(time: float, accent: bool) -> None:
+        note = CLICK_HI if accent else CLICK_LO
+        emit(time, "on", CLICK_CHANNEL, note, 110 if accent else 85,
+             track=CLICK_TRACK)
+        emit(time + 0.05, "off", CLICK_CHANNEL, note, track=CLICK_TRACK)
+
     t = 0.0
+    if count_in and order:
+        # One measure of clicks at the first measure's time signature
+        # (TabKit.jsx 9387-9398)
+        ci_ts = get_time_sig(tracks[0]["measures"][order[0]]
+                             if order[0] < len(tracks[0]["measures"]) else None)
+        c_spb = 60.0 / (song.get("tempo") or DEFAULT_TEMPO) * (4 / (ci_ts.get("den") or 4))
+        for ci in range(ci_ts.get("num") or 4):
+            click(ci * c_spb, ci == 0)
+        t = (ci_ts.get("num") or 4) * c_spb
+
     for mi in order:
         info = meas_map[mi]
+        m_ts = get_time_sig(tracks[0]["measures"][mi]
+                            if mi < len(tracks[0]["measures"]) else None)
+        click_interval = max(1, round(16 / (m_ts.get("den") or 4)))
         for bi in range(info["beats"]):
             out.tick_times.append((round(t, 6), mi, bi))
+            if metronome and bi % click_interval == 0:
+                click(t, bi == 0)
             beat_dur = spb
 
             # Sync pass: tempo changes apply to scheduling math first
@@ -271,8 +328,23 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                                 emit(bt, "bend", ch, fx.get("raw16") or 0, track=ti)
                             elif ft == 200:
                                 st.track_velocity = fv
-                            # 84 handled in sync pass; pedal fx (201/202/
-                            # 204/205) are synth-side effects — Phase 2
+                            elif ft == 201:
+                                for k in ("delayOn", "delayTime", "delayTaps",
+                                          "delayMix"):
+                                    if fx.get(k) is not None:
+                                        st.pedal[k] = fx[k]
+                            elif ft == 202:
+                                for k in ("octOn", "octShift", "octDry",
+                                          "octMix"):
+                                    if fx.get(k) is not None:
+                                        st.pedal[k] = fx[k]
+                            elif ft == 204:
+                                for k in ("tremOn", "tremSpeed", "tremDepth"):
+                                    if fx.get(k) is not None:
+                                        st.pedal[k] = fx[k]
+                            elif ft == 205:
+                                st.pedal["adt"] = fv
+                            # 84 handled in sync pass
 
                     notes = beat.get("notes") or []
                     has_attack = any(n and n.get("attack") and not n.get("stop")
@@ -384,7 +456,10 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                         midi = (harmonic_midi(trk, si, n["fret"]) if is_harm
                                 else note_midi(trk, si, n["fret"]))
                         midi = max(0, min(127, midi))
-                        play_vel = round(vel * 0.5) if is_harm else vel
+                        harm_vel = round(vel * 0.5) if is_harm else vel
+                        dry = (st.pedal["octDry"] / 100
+                               if st.pedal["octOn"] and not is_drum else 1.0)
+                        play_vel = max(0, round(harm_vel * dry))
                         pm_dur = beat_dur * 0.3 if n.get("effect") == FX_PALM_MUTE else 0.0
 
                         # Bends are per-channel in MIDI: recenter before a
@@ -393,12 +468,14 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                         if not is_drum and ch in chan_bend:
                             emit_bend(bt, ch, 0.0, ti, force=True)
 
-                        sounding = [midi]
-                        emit(bt, "on", ch, midi, max(1, min(127, play_vel)),
-                             ti, mi, bi)
-                        if pm_dur and not is_drum:
-                            emit(bt + pm_dur, "off", ch, midi, track=ti)
-                            sounding = []
+                        sounding = []
+                        if play_vel > 0:
+                            sounding.append(midi)
+                            emit(bt, "on", ch, midi, min(127, play_vel),
+                                 ti, mi, bi)
+                            if pm_dur and not is_drum:
+                                emit(bt + pm_dur, "off", ch, midi, track=ti)
+                                sounding.remove(midi)
                         if is_harm:
                             shim = min(127, midi + 12)
                             emit(bt, "on", ch, shim, round(vel * 0.5), ti, mi, bi)
@@ -412,6 +489,49 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                                 emit(bt + pm_dur, "off", ch, dbl, track=ti)
                             else:
                                 sounding.append(dbl)
+
+                        # Pedal effects (TabKit.jsx 10001-10052)
+                        if not is_drum and play_vel > 0:
+                            ped = st.pedal
+                            if ped["adt"]:
+                                # double-tracked copy, 8-43 ms behind
+                                adt_dl = (8 + round(ped["adt"] * 0.35)) / 1000
+                                adt_vol = round(play_vel *
+                                                (0.6 + ped["adt"] / 200))
+                                emit(bt + adt_dl, "on", ch, midi,
+                                     max(1, min(127, adt_vol)), ti, mi, bi)
+                            if ped["octOn"]:
+                                ps_note = max(0, min(127, midi + (ped["octShift"] or -12)))
+                                ps_vel = round(harm_vel * ped["octMix"] / 100)
+                                if ps_vel > 0:
+                                    emit(bt, "on", ch, ps_note, min(127, ps_vel),
+                                         ti, mi, bi)
+                                    sounding.append(ps_note)
+                            if ped["delayOn"]:
+                                # echo taps decaying by mix% each repeat
+                                tap_dt = get_delay_seconds(
+                                    ped["delayTime"], song.get("tempo") or 120)
+                                decay = ped["delayMix"] / 100
+                                for tap in range(1, (ped["delayTaps"] or 3) + 1):
+                                    tv = harm_vel * decay ** tap
+                                    if tv < 3:
+                                        break
+                                    tt = bt + tap_dt * tap
+                                    emit(tt, "on", ch, midi, round(tv), ti, mi, bi)
+                                    emit(tt + tap_dt * 0.9, "off", ch, midi,
+                                         track=ti)
+                            if ped["tremOn"]:
+                                # expression LFO for 3 s (scheduleTremolo)
+                                hz = tremolo_hz(ped["tremSpeed"],
+                                                song.get("tempo") or 120)
+                                lo = round(127 * (1 - ped["tremDepth"] / 100))
+                                half = 1 / hz / 2
+                                i = 0
+                                while i * half <= 3.0:
+                                    emit(bt + i * half, "cc", ch, 11,
+                                         lo if i % 2 == 0 else 127, track=ti)
+                                    i += 1
+                                emit(bt + i * half, "cc", ch, 11, 127, track=ti)
 
                         # Drum choke groups (hi-hat etc.)
                         if is_drum:

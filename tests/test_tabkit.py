@@ -229,3 +229,45 @@ def test_vibrato_emits_oscillation():
     from tabkit.compiler import bend_value
     vals = {e.a for e in bends}
     assert bend_value(0.35) in vals and bend_value(-0.35) in vals
+
+
+def test_metronome_and_count_in():
+    song = make_song(measures=1)
+    song["tracks"][0]["measures"][0]["beats"][0]["notes"][0] = make_note(3)
+    c = compile_song(song, metronome=True, count_in=True)
+    clicks = [e for e in c.events if e.channel == 9 and e.kind == "on"]
+    # 4 count-in clicks + 4 quarter-note clicks in the measure
+    assert len(clicks) == 8
+    assert clicks[0].a == 76 and clicks[1].a == 77  # accent then plain
+    ons = [e for e in c.events if e.kind == "on" and e.channel == 0]
+    assert ons[0].time == pytest.approx(2.0)  # after 4 beats at 120 BPM
+
+
+def test_delay_pedal_taps():
+    song = make_song(measures=1)
+    song["tracks"][0].update({"delayOn": True, "delayMix": 50,
+                              "delayTaps": 3, "delayTime": "8"})
+    song["tracks"][0]["measures"][0]["beats"][0]["notes"][0] = make_note(5)
+    c = compile_song(song)
+    ons = [e for e in c.events if e.kind == "on"]
+    # main note + taps at eighth-note spacing, halving velocity, <3 dropped
+    assert [(round(e.time, 3), e.b) for e in ons] == \
+        [(0.0, 80), (0.25, 40), (0.5, 20), (0.75, 10)]
+
+
+def test_pitch_shifter_pedal():
+    song = make_song(measures=1)
+    song["tracks"][0].update({"octOn": True, "octShift": -12,
+                              "octDry": 100, "octMix": 50})
+    song["tracks"][0]["measures"][0]["beats"][0]["notes"][0] = make_note(0)
+    c = compile_song(song)
+    ons = [e for e in c.events if e.kind == "on"]
+    assert {(e.a, e.b) for e in ons} == {(40, 80), (28, 40)}
+
+
+def test_practice_speed_scales_times():
+    song = make_song(measures=1)
+    song["tracks"][0]["measures"][0]["beats"][8]["notes"][0] = make_note(0)
+    slow = compile_song(song, speed=0.5)
+    on = [e for e in slow.events if e.kind == "on"][0]
+    assert on.time == pytest.approx(2.0)  # 1.0s at full speed

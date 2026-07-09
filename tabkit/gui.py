@@ -39,15 +39,30 @@ LEFT_PAD = 56
 MAX_FRET = 24
 MAX_UNDO = 200
 
+# Track presets (subset of TabKit.jsx INST_PRESETS)
+TRACK_PRESETS = {
+    "Guitar": {"numStrings": 6, "tuning": [40, 45, 50, 55, 59, 64],
+               "instrument": 25},
+    "Bass": {"numStrings": 4, "tuning": [28, 33, 38, 43], "instrument": 33},
+    "Drums": {"numStrings": 8, "tuning": [35, 38, 42, 46, 37, 49, 48, 45],
+              "instrument": 0, "isDrum": True},
+}
+
+
+def empty_measure(num_strings: int, n_beats: int = 16,
+                  ts: dict | None = None) -> dict:
+    ts = ts or {"num": 4, "den": 4}
+    return {"beats": [{"notes": [None] * num_strings} for _ in range(n_beats)],
+            "barLine": "single", "beatsPerMeasure": n_beats,
+            "globalBeatsPerMeasure": n_beats,
+            "timeSig": {"num": ts["num"], "den": ts["den"]}}
+
 
 def new_song() -> dict:
-    def measure():
-        return {"beats": [{"notes": [None] * 6} for _ in range(16)],
-                "barLine": "single", "timeSig": {"num": 4, "den": 4}}
     return {"title": "Untitled", "tempo": 120, "tracks": [{
         "name": "Guitar", "numStrings": 6, "tuning": [40, 45, 50, 55, 59, 64],
         "instrument": 25, "midiChannel": 0,
-        "measures": [measure() for _ in range(4)],
+        "measures": [empty_measure(6) for _ in range(4)],
     }]}
 
 
@@ -61,8 +76,16 @@ class TabView(QWidget):
         self.track_tops: list[int] = []
         self.playhead: tuple[int, int] | None = None  # (measure, global beat)
         self.cursor: dict | None = None  # track/string/measure/beat
+        self.sel: dict | None = None  # track + (measure, beat) start/end
         self.on_key = None  # MainWindow's key handler
         self.setFocusPolicy(Qt.StrongFocus)
+
+    def sel_range(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """Selection as ordered ((mi, bi) start, (mi, bi) end), inclusive."""
+        if not self.sel:
+            return None
+        a, b = self.sel["start"], self.sel["end"]
+        return (a, b) if a <= b else (b, a)
 
     def set_song(self, song) -> None:
         self.song = song
@@ -124,6 +147,17 @@ class TabView(QWidget):
                     beats = trk["measures"][mi]["beats"]
                     bw = mw / max(1, len(beats))
                     bi = min(len(beats) - 1, int((x - mx) // bw))
+                    old = self.cursor
+                    if (event.modifiers() & Qt.ShiftModifier and old
+                            and old["track"] == ti):
+                        if not self.sel:
+                            self.sel = {"track": ti,
+                                        "start": (old["measure"], old["beat"]),
+                                        "end": (mi, bi)}
+                        else:
+                            self.sel["end"] = (mi, bi)
+                    else:
+                        self.sel = None
                     self.cursor = {"track": ti, "string": si,
                                    "measure": mi, "beat": bi}
                     self.setFocus()
@@ -173,6 +207,17 @@ class TabView(QWidget):
                 if measure:
                     beats = measure.get("beats") or []
                     bw = info["beats"] * BEAT_W / max(1, len(beats))
+                    # selection highlight (all strings of the track)
+                    rng = self.sel_range()
+                    if rng and self.sel["track"] == ti:
+                        (smi, sbi), (emi, ebi) = rng
+                        if smi <= mi <= emi:
+                            b0 = sbi if mi == smi else 0
+                            b1 = ebi if mi == emi else len(beats) - 1
+                            p.fillRect(int(x + b0 * bw), y + STRING_H // 2 - 9,
+                                       int((b1 - b0 + 1) * bw),
+                                       (ns - 1) * STRING_H + 18,
+                                       QColor(66, 133, 244, 40))
                     # cursor cell
                     c = self.cursor
                     if (c and c["track"] == ti and c["measure"] == mi):
@@ -237,25 +282,62 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         self.setCentralWidget(scroll)
 
-        tb = QToolBar()
-        tb.setMovable(False)
-        self.addToolBar(tb)
+        self._clipboard: list | None = None  # copied beats (note arrays)
 
-        def act(text, slot, shortcut=None):
+        def act(menu, text, slot, shortcut=None, checkable=False):
             a = QAction(text, self)
             if shortcut:
                 a.setShortcut(shortcut)
+            a.setCheckable(checkable)
             a.triggered.connect(slot)
-            tb.addAction(a)
+            menu.addAction(a)
             return a
 
-        act("New", self.new_file, QKeySequence.New)
-        act("Open", self.open_dialog, QKeySequence.Open)
-        act("Save", self.save, QKeySequence.Save)
-        act("Save As", self.save_as, QKeySequence.SaveAs)
-        self.play_act = act("Play", self.toggle_play)
-        act("Undo", self.undo, QKeySequence.Undo)
-        act("Redo", self.redo, QKeySequence("Ctrl+Shift+Z"))
+        mb = self.menuBar()
+        m_file = mb.addMenu("&File")
+        act(m_file, "New", self.new_file, QKeySequence.New)
+        act(m_file, "Open…", self.open_dialog, QKeySequence.Open)
+        act(m_file, "Save", self.save, QKeySequence.Save)
+        act(m_file, "Save As…", self.save_as, QKeySequence.SaveAs)
+        m_file.addSeparator()
+        act(m_file, "Export MIDI…", self.export_midi)
+
+        m_edit = mb.addMenu("&Edit")
+        act(m_edit, "Undo", self.undo, QKeySequence.Undo)
+        act(m_edit, "Redo", self.redo, QKeySequence("Ctrl+Shift+Z"))
+        m_edit.addSeparator()
+        act(m_edit, "Cut", self.cut_selection, QKeySequence.Cut)
+        act(m_edit, "Copy", self.copy_selection, QKeySequence.Copy)
+        act(m_edit, "Paste", self.paste_clipboard, QKeySequence.Paste)
+        m_edit.addSeparator()
+        act(m_edit, "Insert Bar", self.insert_bar, QKeySequence("Ctrl+B"))
+        act(m_edit, "Delete Bar", self.delete_bar, QKeySequence("Ctrl+Shift+B"))
+
+        m_song = mb.addMenu("&Song")
+        act(m_song, "Title…", self.edit_title)
+        act(m_song, "Tempo…", self.edit_tempo, QKeySequence("Ctrl+T"))
+        m_song.addSeparator()
+        self.metro_act = act(m_song, "Metronome", lambda: None,
+                             QKeySequence("Ctrl+M"), checkable=True)
+        self.count_in_act = act(m_song, "Count-in", lambda: None,
+                                checkable=True)
+
+        m_track = mb.addMenu("&Track")
+        for preset in TRACK_PRESETS:
+            act(m_track, f"Add {preset}",
+                lambda _=False, p=preset: self.add_track(p))
+        m_track.addSeparator()
+        act(m_track, "Duplicate Track", self.duplicate_track)
+        act(m_track, "Rename Track…", self.rename_track)
+        act(m_track, "Delete Track", self.delete_track)
+
+        tb = QToolBar()
+        tb.setMovable(False)
+        self.addToolBar(tb)
+        self.play_act = QAction("Play", self)
+        self.play_act.triggered.connect(self.toggle_play)
+        tb.addAction(self.play_act)
+        tb.addAction(self.metro_act)
         self.status = QLabel("Ready")
         self.statusBar().addWidget(self.status)
 
@@ -448,6 +530,155 @@ class MainWindow(QMainWindow):
     def _commit_pending_fret(self) -> None:
         self._pending_fret = ""
 
+    # --- selection / clipboard ---
+
+    def _sel_beats(self) -> list | None:
+        """Beats in the selection (falling back to the cursor cell)."""
+        c = self.view.cursor
+        rng = self.view.sel_range()
+        trk = self.song["tracks"][self.view.sel["track"] if rng else c["track"]]
+        if not rng:
+            rng = ((c["measure"], c["beat"]), (c["measure"], c["beat"]))
+        (smi, sbi), (emi, ebi) = rng
+        out = []
+        for mi in range(smi, min(emi, len(trk["measures"]) - 1) + 1):
+            beats = trk["measures"][mi]["beats"]
+            b0 = sbi if mi == smi else 0
+            b1 = ebi if mi == emi else len(beats) - 1
+            out.extend(beats[b0:b1 + 1])
+        return out
+
+    def copy_selection(self) -> None:
+        beats = self._sel_beats()
+        self._clipboard = copy.deepcopy([b["notes"] for b in beats])
+        self.status.setText(f"Copied {len(self._clipboard)} beats")
+
+    def cut_selection(self) -> None:
+        beats = self._sel_beats()
+        self._clipboard = copy.deepcopy([b["notes"] for b in beats])
+        self._snapshot()
+        for b in beats:
+            b["notes"] = [None] * len(b["notes"])
+        self._mutated()
+        self.status.setText(f"Cut {len(self._clipboard)} beats")
+
+    def paste_clipboard(self) -> None:
+        if not self._clipboard:
+            return
+        c = self.view.cursor
+        trk = self.song["tracks"][c["track"]]
+        ns = trk["numStrings"]
+        self._snapshot()
+        mi, bi = c["measure"], c["beat"]
+        for notes in self._clipboard:
+            if mi >= len(trk["measures"]):
+                break
+            beats = trk["measures"][mi]["beats"]
+            pasted = copy.deepcopy(notes[:ns])
+            pasted += [None] * (ns - len(pasted))
+            beats[bi]["notes"] = pasted
+            bi += 1
+            if bi >= len(beats):
+                mi, bi = mi + 1, 0
+        self._mutated()
+        self.status.setText(f"Pasted {len(self._clipboard)} beats")
+
+    # --- song / track management ---
+
+    def edit_title(self) -> None:
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(self, "Song title", "Title:",
+                                        text=self.song.get("title") or "")
+        if ok:
+            self._snapshot()
+            self.song["title"] = text
+            self._mutated()
+
+    def edit_tempo(self) -> None:
+        from PySide6.QtWidgets import QInputDialog
+        val, ok = QInputDialog.getInt(self, "Tempo", "BPM:",
+                                      self.song.get("tempo") or 120, 30, 500)
+        if ok:
+            self._snapshot()
+            self.song["tempo"] = val
+            self._mutated()
+
+    def _free_channel(self, drums: bool) -> int:
+        if drums:
+            return 9
+        used = {t.get("midiChannel", i)
+                for i, t in enumerate(self.song["tracks"])}
+        for ch in range(16):
+            if ch != 9 and ch not in used:
+                return ch
+        return 0
+
+    def add_track(self, preset_name: str) -> None:
+        preset = TRACK_PRESETS[preset_name]
+        self._snapshot()
+        n_meas = len(self.song["tracks"][0]["measures"])
+        ns = preset["numStrings"]
+        track = {
+            "name": preset_name, "numStrings": ns,
+            "tuning": list(preset["tuning"]),
+            "instrument": preset["instrument"],
+            "isDrum": bool(preset.get("isDrum")),
+            "midiChannel": self._free_channel(bool(preset.get("isDrum"))),
+            "measures": [empty_measure(ns) for _ in range(n_meas)],
+        }
+        self.song["tracks"].append(track)
+        self.view.cursor = {"track": len(self.song["tracks"]) - 1,
+                            "string": 0, "measure": 0, "beat": 0}
+        self._mutated()
+        self.status.setText(f"Added {preset_name} track")
+
+    def duplicate_track(self) -> None:
+        c = self.view.cursor
+        self._snapshot()
+        dup = copy.deepcopy(self.song["tracks"][c["track"]])
+        dup["name"] = (dup.get("name") or "Track") + " (copy)"
+        if not dup.get("isDrum"):
+            dup["midiChannel"] = self._free_channel(False)
+        self.song["tracks"].insert(c["track"] + 1, dup)
+        self._mutated()
+        self.status.setText("Duplicated track")
+
+    def rename_track(self) -> None:
+        from PySide6.QtWidgets import QInputDialog
+        c = self.view.cursor
+        trk = self.song["tracks"][c["track"]]
+        text, ok = QInputDialog.getText(self, "Rename track", "Name:",
+                                        text=trk.get("name") or "")
+        if ok and text:
+            self._snapshot()
+            trk["name"] = text
+            self._mutated()
+
+    def delete_track(self) -> None:
+        if len(self.song["tracks"]) <= 1:
+            self.status.setText("Cannot delete last track")
+            return
+        c = self.view.cursor
+        self._snapshot()
+        self.song["tracks"].pop(c["track"])
+        self.view.sel = None
+        self._mutated()
+        self.status.setText("Deleted track")
+
+    def export_midi(self) -> None:
+        from .midi_export import export_midi
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export MIDI", "song.mid", "MIDI files (*.mid)")
+        if not path:
+            return
+        compiled = compile_song(self.song)
+        try:
+            export_midi(self.song, compiled, path)
+        except Exception as exc:
+            QMessageBox.critical(self, "TabKit", f"Export failed:\n{exc}")
+            return
+        self.status.setText(f"Exported {path}")
+
     def handle_key(self, event) -> bool:
         c = self.view.cursor
         if not c:
@@ -464,11 +695,23 @@ class MainWindow(QMainWindow):
                 return True
             return False
 
+        if key == Qt.Key_Escape:
+            self.view.sel = None
+            self.view.update()
+            return True
+
         nav = {Qt.Key_Left: (0, -1), Qt.Key_Right: (0, 1),
                Qt.Key_Up: (-1, 0), Qt.Key_Down: (1, 0)}
         if key in nav:
             ds, db = nav[key]
             self._pending_fret = ""
+            shift_sel = bool(mods & Qt.ShiftModifier) and db
+            if shift_sel and not self.view.sel:
+                self.view.sel = {"track": c["track"],
+                                 "start": (c["measure"], c["beat"]),
+                                 "end": (c["measure"], c["beat"])}
+            elif not shift_sel:
+                self.view.sel = None
             trk = self.song["tracks"][c["track"]]
             if db:
                 beats = self._cursor_beats()
@@ -491,6 +734,8 @@ class MainWindow(QMainWindow):
                         c["string"] = (0 if ds > 0 else
                                        self.song["tracks"][nt]["numStrings"] - 1)
             self.view.clamp_cursor()
+            if shift_sel:
+                self.view.sel["end"] = (c["measure"], c["beat"])
             self.view.update()
             return True
 
@@ -545,7 +790,10 @@ class MainWindow(QMainWindow):
             return
         if not self.song or self._ensure_backend() is None:
             return
-        compiled = compile_song(self.song)
+        compiled = compile_song(self.song,
+                                metronome=self.metro_act.isChecked(),
+                                count_in=(self.count_in_act.isChecked()
+                                          and self.metro_act.isChecked()))
         start = 0.0
         c = self.view.cursor
         if from_cursor and c:

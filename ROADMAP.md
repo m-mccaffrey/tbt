@@ -36,13 +36,21 @@ Reference implementation: `legacy-web/TabKit.jsx` (line numbers below).
       chains, releases (fx 114), pre-bends
 - [x] Vibrato (fx 126): ±35-cent 6 Hz oscillation, bend-offset centered
 - [x] Hammer-on/pull-off velocity reduction (fx 104/112)
+- [x] Selection (shift+arrows / shift+click), cut/copy/paste across
+      measures, Escape clears
+- [x] Track management: add Guitar/Bass/Drums presets with automatic
+      channel allocation, duplicate, rename, delete
+- [x] Pedal effects compiled to events: delay taps (decay by mix%, tap
+      interval from tempo), pitch shifter (dry/wet + shift), tremolo as
+      a CC11 expression LFO, ADT delayed double; fx 201/202/204/205
+      update pedal state mid-song
+- [x] Metronome (quarter-note clicks, accented downbeats) + one-measure
+      count-in; practice speed parameter in the compiler
+- [x] Song title/tempo dialogs, MIDI export from the GUI
 - [ ] Channel-per-string voice allocation so simultaneous bends on
       different strings don't share one channel's pitch wheel
-- [ ] Selection, copy/paste
-- [ ] Track management (add/delete/duplicate, tuning presets, drum lanes)
-- [ ] Pedal effects: delay taps, pitch shifter, tremolo, ADT (fx 201-205)
-      as compiled event patterns instead of the web version's setTimeouts
-- [ ] Sections strip, count-in, metronome, practice/loop mode
+- [ ] Sections strip, practice/loop mode UI (speed knob, loop region)
+- [ ] Tuning editor / drum lane editor
 - [ ] TBT / Guitar Pro import (parsers exist in JSX ~1360-2100)
 
 ## Phase 3 — "musician features" (the reason for going native)
