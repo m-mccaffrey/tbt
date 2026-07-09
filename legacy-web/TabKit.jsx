@@ -899,9 +899,12 @@ function warmSF2Cache(onProgress) {
 }
 
 // --- Synth functions ---
-function synthOn(ch, note, vel, prog, dur, noDecay, bank, detuneCents) {
-  var ctx = getCtx(); var t = ctx.currentTime; var key = ch + "-" + note + (detuneCents ? "d" + detuneCents : "");
-  if (_notes[key]) synthOff(ch, note, detuneCents);
+function synthOn(ch, note, vel, prog, dur, noDecay, bank, detuneCents, when) {
+  // when: optional absolute AudioContext time for the onset. Callers that run
+  // ahead of the beat (see SCHED_LEAD_MS) pass it so onsets land on the audio
+  // clock instead of whenever the JS timer happened to fire.
+  var ctx = getCtx(); var t = (when && when > ctx.currentTime) ? when : ctx.currentTime; var key = ch + "-" + note + (detuneCents ? "d" + detuneCents : "");
+  if (_notes[key]) synthOff(ch, note, detuneCents, when);
   var v = ((vel || 80) / 127) * 0.7;
   var endT = dur > 0 ? t + dur : 0;
   var outNode = getChNode(ch).gain;
@@ -1007,19 +1010,19 @@ function getDelayMs(delayTime, tempo) {
   return beatMs * 0.75;
 }
 
-function scheduleDelay(ch, note, vel, prog, dur, bank, delayMs, taps, mixPct) {
+function scheduleDelay(ch, note, vel, prog, dur, bank, delayMs, taps, mixPct, when) {
   var decay = mixPct / 100;
   for (var tap = 1; tap <= taps; tap++) {
     (function(t, v) {
-      setTimeout(function() { if (v >= 3) synthOn(ch, note, Math.round(v), prog, dur, false, bank); }, Math.round(delayMs * t));
+      setTimeout(function() { if (v >= 3) synthOn(ch, note, Math.round(v), prog, dur, false, bank, undefined, when ? when + delayMs * t / 1000 : undefined); }, Math.round(delayMs * t));
     })(tap, vel * Math.pow(decay, tap));
   }
 }
 
-function scheduleTremolo(ch, speed, depth) {
+function scheduleTremolo(ch, speed, depth, when) {
   var node = getChNode(ch);
   if (!node || !node.gain) return;
-  var ctx = getCtx(); var t = ctx.currentTime;
+  var ctx = getCtx(); var t = (when && when > ctx.currentTime) ? when : ctx.currentTime;
   var baseVol = node.gain.gain.value || 0.5;
   var lo = baseVol * (1 - depth/100);
   var halfPeriod = 1 / speed / 2;
@@ -1041,10 +1044,10 @@ function sf2HasPreset(bank, prog) {
   return _sf2.presets[bank] && _sf2.presets[bank][prog] && _sf2.presets[bank][prog].length > 0;
 }
 
-function synthOff(ch, note, detuneCents) {
+function synthOff(ch, note, detuneCents, when) {
   var key = ch + "-" + note + (detuneCents ? "d" + detuneCents : ""); var n = _notes[key]; if (!n) return;
   try {
-    var ctx = getCtx(); var t = ctx.currentTime;
+    var ctx = getCtx(); var t = (when && when > ctx.currentTime) ? when : ctx.currentTime;
     var rel = n.rel || 0.1;
     if (n.gn) { var cv = n.gn.gain.value || 0.001; n.gn.gain.cancelScheduledValues(t); n.gn.gain.setValueAtTime(Math.max(cv, 0.001), t); n.gn.gain.exponentialRampToValueAtTime(0.001, t + rel); }
     if (n.src) try { n.src.stop(t + rel + 0.05); } catch(e){}
@@ -1054,21 +1057,22 @@ function synthOff(ch, note, detuneCents) {
 }
 
 // Hard kill: immediate silence (for stop notes / palm mutes)
-function synthKill(ch, note) {
+function synthKill(ch, note, when) {
   var key = ch + "-" + note; var n = _notes[key]; if (!n) return;
+  var tk = (when && _actx && when > _actx.currentTime) ? when : 0;
   try {
-    if (n.gn) { try { n.gn.gain.cancelScheduledValues(0); n.gn.gain.setValueAtTime(0, 0); } catch(e4){} try { n.gn.disconnect(); } catch(e6){} }
-    if (n.src) try { n.src.stop(0); } catch(e2){}
-    if (n.s2) try { n.s2.stop(0); } catch(e3){}
+    if (n.gn) { try { n.gn.gain.cancelScheduledValues(tk); n.gn.gain.setValueAtTime(0, tk); } catch(e4){} if (!tk) try { n.gn.disconnect(); } catch(e6){} }
+    if (n.src) try { n.src.stop(tk); } catch(e2){}
+    if (n.s2) try { n.s2.stop(tk); } catch(e3){}
   } catch(e) {}
   delete _notes[key];
 }
 
 // Fast choke: ~25ms exponential decay (cymbal grab / hi-hat close)
-function synthChoke(ch, note) {
+function synthChoke(ch, note, when) {
   var key = ch + "-" + note; var n = _notes[key]; if (!n) return;
   try {
-    var ctx = getCtx(); var t = ctx.currentTime;
+    var ctx = getCtx(); var t = (when && when > ctx.currentTime) ? when : ctx.currentTime;
     if (n.gn) {
       var cv = n.gn.gain.value || 0.001;
       n.gn.gain.cancelScheduledValues(t);
@@ -2396,9 +2400,9 @@ function _chevron(dir, color, sz, mode) { var c=color||"#333"; var s='stroke="'+
 function _playAllIco(color, sz) { return React.createElement("img", {src:"data:image/svg+xml,"+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path d="M1 2l7 6-7 6z" fill="'+(color||"#333")+'" opacity=".5"/><path d="M4 2l7 6-7 6z" fill="'+(color||"#333")+'" opacity=".75"/><path d="M7 2l7 6-7 6z" fill="'+(color||"#333")+'"/></svg>'),width:sz||16,height:sz||16,style:{verticalAlign:"middle",pointerEvents:"none"},draggable:false}); }
 
 // Per-note pitch manipulation for techniques
-function synthBendNote(ch, note, targetSemitones, duration) {
+function synthBendNote(ch, note, targetSemitones, duration, when) {
   var key = ch + "-" + note; var n = _notes[key]; if (!n || !n.sf || !n.src) return;
-  var ctx = _actx; if (!ctx) return; var t = ctx.currentTime;
+  var ctx = _actx; if (!ctx) return; var t = (when && when > ctx.currentTime) ? when : ctx.currentTime;
   var baseRate = n.baseRate || 1;
   var bendCents = (getChNode(ch).bendCents || 0);
   var currentRate = n.src.playbackRate.value || baseRate; // read actual current rate
@@ -2417,9 +2421,9 @@ function synthPreBendNote(ch, note, semitones) {
   var newRate = baseRate * Math.pow(2, (bendCents + semitones * 100) / 1200);
   try { n.src.playbackRate.setValueAtTime(newRate, ctx.currentTime); } catch(e) {}
 }
-function synthVibratoNote(ch, note, durationSec, semiOffset) {
+function synthVibratoNote(ch, note, durationSec, semiOffset, when) {
   var key = ch + "-" + note; var n = _notes[key]; if (!n || !n.sf || !n.src) return;
-  var ctx = _actx; if (!ctx) return; var t = ctx.currentTime;
+  var ctx = _actx; if (!ctx) return; var t = (when && when > ctx.currentTime) ? when : ctx.currentTime;
   var baseRate = n.baseRate || 1;
   var bendCents = (getChNode(ch).bendCents || 0);
   // Use explicit semitone offset if provided, otherwise read actual current rate
@@ -9530,8 +9534,10 @@ function App() {
     var hammerNext = {}; // hammerNext[trkIdx][si] = true if next note should have reduced velocity
     var suppressNext = {}; // suppressNext[trkIdx][si] = true if next note is a bend/slide/release destination
     var playedBeats = {}; // "trackIdx-measure-beatIdx" prevents double scheduling
-    function killString(trkIdx, trk, si, hard) {
-      var off = hard === "choke" ? synthChoke : hard ? synthKill : synthOff;
+    function killString(trkIdx, trk, si, hard, when) {
+      var off = hard === "choke" ? function(c,n2){ synthChoke(c, n2, when); }
+               : hard ? function(c,n2){ synthKill(c, n2, when); }
+               : function(c,n2){ synthOff(c, n2, undefined, when); };
       var old = activeNotes[trkIdx][si];
       if (old !== undefined) { off(trk.midiChannel, old); delete activeNotes[trkIdx][si]; }
       var oldShim = activeNotes[trkIdx]["h_"+si];
@@ -9540,7 +9546,7 @@ function App() {
       if (old12 !== undefined) { off(trk.midiChannel, old12); delete activeNotes[trkIdx]["12s_"+si]; }
       // Kill ADT doubled note
       var oldAdt = activeNotes[trkIdx]["adt_"+si];
-      if (oldAdt !== undefined) { synthOff(trk.midiChannel, oldAdt.midi, oldAdt.detune); delete activeNotes[trkIdx]["adt_"+si]; }
+      if (oldAdt !== undefined) { synthOff(trk.midiChannel, oldAdt.midi, oldAdt.detune, when); delete activeNotes[trkIdx]["adt_"+si]; }
       delete ringFlags[trkIdx][si];
     }
 
@@ -9584,6 +9590,11 @@ function App() {
       }
     }
 
+    // Beat callbacks fire this many ms EARLY; every audible event inside them
+    // is scheduled at its absolute audio-clock time (onsetT), so note onsets
+    // no longer inherit setTimeout jitter. Late timers only matter if they
+    // exceed this lead.
+    var SCHED_LEAD_MS = 80;
     pRef.current = setInterval(function() {
       // Safety: if stop was called but interval wasn't cleared (race condition)
       if (!_playIntent.current) { if(pRef.current){clearInterval(pRef.current);pRef.current=null;} return; }
@@ -9809,7 +9820,7 @@ function App() {
             if (playedBeats[pbKey]) { console.warn("[DUP] beat " + mp.idx + " already played"); continue; }
             playedBeats[pbKey] = true;
             // IIFE captures ALL needed state - no shared function reference
-            (function(trkRef, trkIdxRef, measRef, measIdx, beatIdx, isFirst, dl, beatTime) {
+            (function(trkRef, trkIdxRef, measRef, measIdx, beatIdx, isFirst, dl, beatTime, onsetT) {
               var doPlay = function() {
                 if (!pRef.current) return;
                 // Live mute/solo check - skip if this track should be silent
@@ -9862,7 +9873,7 @@ function App() {
                     if (!beat2.notes[ks4] || (!beat2.notes[ks4].attack)) {
                       // Skip killing strings with indefinite ring flag
                       if (ringFlags[trkIdxRef] && ringFlags[trkIdxRef][ks4]) continue;
-                      killString(trkIdxRef,trkRef,ks4);
+                      killString(trkIdxRef,trkRef,ks4,undefined,onsetT);
                     }
                   }
                 }
@@ -9883,7 +9894,7 @@ function App() {
                             var dvBase = dvN.baseRate || 1;
                             var dvBC = (getChNode(trkRef.midiChannel).bendCents || 0);
                             var dvCenter = dvBase * Math.pow(2, (dvBC + vibOff * 100) / 1200);
-                            var dvC = 35, dvR = 6, dvT = _actx ? _actx.currentTime : 0;
+                            var dvC = 35, dvR = 6, dvT = _actx ? ((onsetT && onsetT > _actx.currentTime) ? onsetT : _actx.currentTime) : 0;
                             try {
                               dvN.src.playbackRate.cancelScheduledValues(dvT);
                               dvN.src.playbackRate.setValueAtTime(dvCenter, dvT);
@@ -9904,8 +9915,9 @@ function App() {
                         if (dN && dN.src) {
                           try {
                             var dCtx = _actx;
-                            dN.src.playbackRate.cancelScheduledValues(dCtx.currentTime);
-                            dN.src.playbackRate.setValueAtTime(dN.src.playbackRate.value, dCtx.currentTime);
+                            var dT0 = (onsetT && onsetT > dCtx.currentTime) ? onsetT : dCtx.currentTime;
+                            dN.src.playbackRate.cancelScheduledValues(dT0);
+                            dN.src.playbackRate.setValueAtTime(dN.src.playbackRate.value, dT0);
                           } catch(e2) {}
                         }
                         var dChainTime = beatTime;
@@ -9935,7 +9947,7 @@ function App() {
                           var dRNext = findNextNote(trkRef, measIdx, beatIdx, si4);
                           if (dRNext) {
                             var dRSemi = dRNext.midi - activeMidi;
-                            synthBendNote(trkRef.midiChannel, activeMidi, dRSemi, dRNext.beats * spb);
+                            synthBendNote(trkRef.midiChannel, activeMidi, dRSemi, dRNext.beats * spb, onsetT);
                             if (!suppressNext[trkIdxRef]) suppressNext[trkIdxRef] = {};
                             suppressNext[trkIdxRef][si4] = (suppressNext[trkIdxRef][si4] || 0) + 1;
                           }
@@ -9945,9 +9957,9 @@ function App() {
                     }
                     continue;
                   }
-                  if(n4.stop){killString(trkIdxRef,trkRef,si4,trkRef.isDrum?"choke":true);}
+                  if(n4.stop){killString(trkIdxRef,trkRef,si4,trkRef.isDrum?"choke":true,onsetT);}
                   else if(n4.muted){
-                    killString(trkIdxRef,trkRef,si4,true);
+                    killString(trkIdxRef,trkRef,si4,true,onsetT);
                     var mutVel=Math.round((n4.vel!==undefined?n4.vel:(trkRef.trackVelocity||80))*0.4);
                     var mm2=trkRef.isDrum?(trkRef.tuning[si4]||0):(trkRef.tuning[si4]||40)+(trkRef.capo||0)+(trkRef.transpose||0);
                     // Check if another string has an active note at the same MIDI pitch
@@ -9959,10 +9971,10 @@ function App() {
                       }
                     }
                     if (!mutCollision) {
-                      synthOn(trkRef.midiChannel,mm2,mutVel,trkRef.instrument,beatDur*0.2);
+                      synthOn(trkRef.midiChannel,mm2,mutVel,trkRef.instrument,beatDur*0.2,undefined,undefined,undefined,onsetT);
                       if(trkRef.twelveStringMode&&!trkRef.isDrum){
                         var oct12m=si4<(trkRef.numStrings-2)?12:0;
-                        synthOn(trkRef.midiChannel,mm2+oct12m,Math.round(mutVel*0.75),trkRef.instrument,beatDur*0.2);
+                        synthOn(trkRef.midiChannel,mm2+oct12m,Math.round(mutVel*0.75),trkRef.instrument,beatDur*0.2,undefined,undefined,undefined,onsetT);
                       }
                     }
                   } else {
@@ -9977,7 +9989,7 @@ function App() {
                       continue;
                     }
                     suppressNext[trkIdxRef][si4] = 0;
-                    killString(trkIdxRef,trkRef,si4);
+                    killString(trkIdxRef,trkRef,si4,undefined,onsetT);
                     var nVel=n4.vel!==undefined?n4.vel:(trkRef.trackVelocity||80);
                     if (!hammerNext[trkIdxRef]) hammerNext[trkIdxRef] = {};
                     if (hammerNext[trkIdxRef][si4]) { nVel = Math.round(nVel * 0.9); delete hammerNext[trkIdxRef][si4]; }
@@ -9997,7 +10009,7 @@ function App() {
                     var _psr=pedalState[trkIdxRef]||{};
                     var dryScale=(_psr.octOn&&!trkRef.isDrum&&_psr.octDry!=null)?_psr.octDry/100:1;
                     var playVel=Math.max(0,Math.round(harmVel*dryScale));
-                    if(playVel>0)synthOn(trkRef.midiChannel,md2,playVel,trkRef.instrument,trkRef.isDrum?0:pmDur,!!n4.ring);
+                    if(playVel>0)synthOn(trkRef.midiChannel,md2,playVel,trkRef.instrument,trkRef.isDrum?0:pmDur,!!n4.ring,undefined,undefined,onsetT);
                     // ADT: automatic double tracking - play detuned copy with slight delay
                     var _adtAmt = trkRef.adt || 0;
                     if (_adtAmt > 0 && !trkRef.isDrum && playVel > 0) {
@@ -10007,12 +10019,12 @@ function App() {
                       var adtSign = (si4 % 2 === 0) ? 1 : -1; // alternate detune direction per string
                       var adtDet = adtSign * adtDetune;
                       activeNotes[trkIdxRef]["adt_"+si4] = {midi: md2, detune: adtDet};
-                      (function(_ch, _md, _vel, _inst, _dur, _ring, _det, _dl) {
+                      (function(_ch, _md, _vel, _inst, _dur, _ring, _det, _dl, _when) {
                         setTimeout(function() {
                           if (!pRef.current) return;
-                          synthOn(_ch, _md, _vel, _inst, _dur, _ring, undefined, _det);
+                          synthOn(_ch, _md, _vel, _inst, _dur, _ring, undefined, _det, _when);
                         }, _dl);
-                      })(trkRef.midiChannel, md2, adtVol, trkRef.instrument, trkRef.isDrum ? 0 : pmDur, !!n4.ring, adtDet, adtDelay);
+                      })(trkRef.midiChannel, md2, adtVol, trkRef.instrument, trkRef.isDrum ? 0 : pmDur, !!n4.ring, adtDet, adtDelay, onsetT + adtDelay / 1000);
                     }
                     // Drum choke groups: playing one kills ringing notes in same group
                     if (trkRef.isDrum) {
@@ -10025,30 +10037,30 @@ function App() {
                             if (csi === si4) continue;
                             var activeM = activeNotes[trkIdxRef][csi];
                             if (activeM !== undefined && cg.indexOf(activeM) >= 0) {
-                              killString(trkIdxRef, trkRef, csi, "choke");
+                              killString(trkIdxRef, trkRef, csi, "choke", onsetT);
                             }
                           }
                         }
                       }
                     }
-                    if(isHarm4){var shimMd=Math.min(127,md2+12);synthOn(trkRef.midiChannel,shimMd,Math.round(nVel*0.5),trkRef.instrument,0);activeNotes[trkIdxRef]["h_"+si4]=shimMd;}
+                    if(isHarm4){var shimMd=Math.min(127,md2+12);synthOn(trkRef.midiChannel,shimMd,Math.round(nVel*0.5),trkRef.instrument,0,undefined,undefined,undefined,onsetT);activeNotes[trkIdxRef]["h_"+si4]=shimMd;}
                     // Pitch Shifter effect
                     if(_psr.octOn&&!trkRef.isDrum){
                       var psShift=_psr.octShift||-12;var psWet=_psr.octMix||50;
                       var psNote=Math.max(0,Math.min(127,md2+psShift));
-                      synthOn(trkRef.midiChannel,psNote,Math.round(harmVel*psWet/100),trkRef.instrument,pmDur);
+                      synthOn(trkRef.midiChannel,psNote,Math.round(harmVel*psWet/100),trkRef.instrument,pmDur,undefined,undefined,undefined,onsetT);
                     }
 
                     // Tremolo effect
                     if(_psr.tremOn&&!trkRef.isDrum){
                       var tremBPM=song.tempo||120;var tremSpd=_psr.tremSpeed||"8";
                       var tremHz=tremSpd==="4"?tremBPM/60:tremSpd==="8"?tremBPM/30:tremSpd==="8t"?tremBPM/20:tremBPM/15;
-                      scheduleTremolo(trkRef.midiChannel,tremHz,_psr.tremDepth||70);
+                      scheduleTremolo(trkRef.midiChannel,tremHz,_psr.tremDepth||70,onsetT);
                     }
                     // Delay effect
                     if(_psr.delayOn&&!trkRef.isDrum){
                       var dMs=getDelayMs(_psr.delayTime||"8d",song.tempo||120);
-                      scheduleDelay(trkRef.midiChannel,md2,harmVel,trkRef.instrument,pmDur,trkRef.bank||0,dMs,_psr.delayTaps||3,_psr.delayMix||50);
+                      scheduleDelay(trkRef.midiChannel,md2,harmVel,trkRef.instrument,pmDur,trkRef.bank||0,dMs,_psr.delayTaps||3,_psr.delayMix||50,onsetT);
                     }
                     activeNotes[trkIdxRef][si4]=md2;
                     if(n4.ring) ringFlags[trkIdxRef][si4]=true; else delete ringFlags[trkIdxRef][si4];
@@ -10060,7 +10072,7 @@ function App() {
                     // Technique playback
                     if(!trkRef.isDrum && n4.effect) {
                       var efx4 = n4.effect;
-                      if (efx4 === 126) { synthVibratoNote(trkRef.midiChannel, md2, 3, bendState[trkIdxRef] ? bendState[trkIdxRef][si4] : undefined); }
+                      if (efx4 === 126) { synthVibratoNote(trkRef.midiChannel, md2, 3, bendState[trkIdxRef] ? bendState[trkIdxRef][si4] : undefined, onsetT); }
                       // Bend/Slide: scan FULL chain and schedule all ramps at once
                       if (efx4 === 98 || efx4 === 47 || efx4 === 92) {
                         var chainMidi = md2;
@@ -10110,7 +10122,7 @@ function App() {
                           var rNext = findNextNote(trkRef, measIdx, beatIdx, si4);
                           if (rNext) {
                             var rSemi = rNext.midi - md2;
-                            synthBendNote(trkRef.midiChannel, md2, rSemi, rNext.beats * spb);
+                            synthBendNote(trkRef.midiChannel, md2, rSemi, rNext.beats * spb, onsetT);
                             if (!suppressNext[trkIdxRef]) suppressNext[trkIdxRef] = {};
                             suppressNext[trkIdxRef][si4] = (suppressNext[trkIdxRef][si4] || 0) + 1;
                           }
@@ -10132,14 +10144,14 @@ function App() {
                     // 12-string doubling in 6-line mode
                     if(trkRef.twelveStringMode&&!trkRef.isDrum){
                       var oct12=si4<(trkRef.numStrings-2)?12:0;
-                      synthOn(trkRef.midiChannel,md2+oct12,Math.round(nVel*0.9),trkRef.instrument,0);
+                      synthOn(trkRef.midiChannel,md2+oct12,Math.round(nVel*0.9),trkRef.instrument,0,undefined,undefined,undefined,onsetT);
                       activeNotes[trkIdxRef]["12s_"+si4]=md2+oct12;
                     }
                   }
                 }
               };
-              setTimeout(doPlay, dl);
-            })(trk, trkIdx, meas, mb.mi, mp.idx, mpi === firstAttackMpi, absDelay, nextT);
+              setTimeout(doPlay, Math.max(0, dl - SCHED_LEAD_MS));
+            })(trk, trkIdx, meas, mb.mi, mp.idx, mpi === firstAttackMpi, absDelay, nextT, nextT + mp.delay / 1000);
           }
         }
 

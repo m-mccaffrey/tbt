@@ -4,8 +4,10 @@ Native guitar tablature editor and sequencer. Python port of the TabKit
 web app, prioritizing playback timing (the web version scheduled note
 onsets on main-thread timers; this engine holds onset error under 0.02 ms).
 
-The original web app is preserved unmodified in `legacy-web/` as the
-feature reference. Progress toward parity: see `ROADMAP.md`.
+The original web app lives in `legacy-web/` as the feature reference;
+its playback scheduler has since been fixed to schedule note onsets on
+the Web Audio clock (see `web/README.md`), and `web/build.mjs`
+precompiles it for deployment. Progress toward parity: see `ROADMAP.md`.
 
 ## Install
 

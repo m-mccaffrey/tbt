@@ -20,15 +20,26 @@ Measured in headless Chromium (local static server, cold load):
 | `js` branch (Babel standalone) | ~5.8 s |
 | `web/dist` (precompiled) | ~0.16 s |
 
-## What this does and doesn't fix
+## Audio-clock note scheduling
 
 Precompiling removes the load-time stall and the ~2.4 MB Babel download,
-and frees the main thread sooner. It does **not** change playback timing
-accuracy: note onsets are still triggered by `setTimeout`/`setInterval`
-callbacks that start notes at whatever `ctx.currentTime` is when the
-callback runs (`synthOn` in `TabKit.jsx`), so onsets still jitter with
-main-thread load. The metronome already shows the fix — `synthClick`
-takes a scheduled audio-clock time (`nextT`). Reliable timing means
-threading that same `when` parameter through `synthOn` and starting
-sources at the scheduled time; that is the approach the Python port in
-this repo was built around.
+but on its own it does not change playback timing: the engine originally
+started notes at whatever `ctx.currentTime` happened to be when a
+`setTimeout` callback fired, so onsets jittered with main-thread load.
+
+`legacy-web/TabKit.jsx` now schedules on the audio clock instead (the
+same pattern its metronome always used): beat callbacks fire
+`SCHED_LEAD_MS` (80 ms) early, and every onset, kill, bend, vibrato,
+tremolo, and delay tap inside them carries an absolute AudioContext
+time (`onsetT`) down through `synthOn`/`synthOff`/`killString` and
+friends. Timer lateness no longer moves note onsets unless it exceeds
+the lead.
+
+Measured in headless Chromium playing `examples/demo.tkt` (tempo 140,
+16th-note grid = 107.14 ms) while a busy-loop stalls the main thread
+60 ms out of every 150 ms:
+
+| Build | Onset error vs grid (RMS / max) | Scheduling headroom |
+| --- | --- | --- |
+| before | 49.8 ms / 92.7 ms | ~0 ms |
+| after | 0.00 ms / 0.00 ms | ~65 ms mean, 27 ms min |
