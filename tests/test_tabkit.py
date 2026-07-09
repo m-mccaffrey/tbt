@@ -178,3 +178,54 @@ def test_midi_export(tmp_path):
     mid = mido.MidiFile(str(out))
     notes = [m for m in mid if m.type == "note_on"]
     assert notes and notes[0].note == 43
+
+
+def test_bend_chain_suppresses_target():
+    song = make_song(measures=1)
+    b = song["tracks"][0]["measures"][0]["beats"]
+    b[0]["notes"][0] = {"fret": 5, "attack": True, "effect": 98}  # bend
+    b[4]["notes"][0] = make_note(7)  # bend target
+    compiled = compile_song(song)
+    ons = [e for e in compiled.events if e.kind == "on"]
+    assert len(ons) == 1, "chain target must not retrigger"
+    bends = [e for e in compiled.events if e.kind == "bend"]
+    assert bends[-1].time == pytest.approx(4 * 0.125)
+    from tabkit.compiler import bend_value
+    assert bends[-1].a == bend_value(2.0)  # arrived +2 semitones
+
+
+def test_slide_then_plain_note_recenters():
+    song = make_song(measures=1)
+    b = song["tracks"][0]["measures"][0]["beats"]
+    b[0]["notes"][0] = {"fret": 3, "attack": True, "effect": 92}  # slide up
+    b[4]["notes"][0] = make_note(8)   # slide target (suppressed)
+    b[8]["notes"][0] = make_note(0)   # plain note afterwards
+    compiled = compile_song(song)
+    ons = [e for e in compiled.events if e.kind == "on"]
+    assert [e.a for e in ons] == [43, 40]
+    # the plain attack must recenter the channel bend
+    recenter = [e for e in compiled.events
+                if e.kind == "bend" and e.time == pytest.approx(1.0)]
+    assert recenter and recenter[-1].a == 8192
+
+
+def test_hammer_on_reduces_next_velocity():
+    song = make_song(measures=1)
+    b = song["tracks"][0]["measures"][0]["beats"]
+    b[0]["notes"][0] = {"fret": 0, "attack": True, "effect": 104}
+    b[2]["notes"][0] = make_note(2)
+    compiled = compile_song(song)
+    ons = [e for e in compiled.events if e.kind == "on"]
+    assert ons[0].b == 80 and ons[1].b == 72  # 90% of 80
+
+
+def test_vibrato_emits_oscillation():
+    song = make_song(measures=1)
+    b = song["tracks"][0]["measures"][0]["beats"]
+    b[0]["notes"][0] = {"fret": 5, "attack": True, "effect": 126}
+    compiled = compile_song(song)
+    bends = [e for e in compiled.events if e.kind == "bend"]
+    assert len(bends) >= 30  # 6 Hz for 3 s, two edges per cycle
+    from tabkit.compiler import bend_value
+    vals = {e.a for e in bends}
+    assert bend_value(0.35) in vals and bend_value(-0.35) in vals

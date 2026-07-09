@@ -108,6 +108,36 @@ def note_midi(track: dict[str, Any], string_idx: int, fret: int) -> int:
     return (open_note or 40) + fret + (track.get("capo") or 0) + (track.get("transpose") or 0)
 
 
+def find_next_note(track: dict[str, Any], mi: int, bi: int, string_idx: int
+                   ) -> dict[str, Any] | None:
+    """Next sounding note on a string after (mi, bi), in score order.
+
+    Returns fret/midi/mi/bi and the distance in global beats (tuplet
+    aware). Port of TabKit.jsx findNextNote (line 9283).
+    """
+    measures = track["measures"]
+    for lm in range(mi, len(measures)):
+        start_bi = bi + 1 if lm == mi else 0
+        beats = measures[lm].get("beats") or []
+        for lb in range(start_bi, len(beats)):
+            notes = beats[lb].get("notes") or []
+            ln = notes[string_idx] if string_idx < len(notes) else None
+            if ln and ln.get("attack") and not ln.get("stop") and not ln.get("muted"):
+                dist = 0.0
+                for dm in range(mi, lm + 1):
+                    d_start = bi if dm == mi else 0
+                    d_end = lb if dm == lm else len(measures[dm].get("beats") or [])
+                    for db in range(d_start, d_end):
+                        wb = (measures[dm].get("beats") or [])[db]
+                        if wb and (wb.get("atrGroup") or 0) > 1:
+                            dist += (wb.get("atrNum") or 1) / wb["atrGroup"]
+                        else:
+                            dist += 1
+                return {"fret": ln["fret"], "midi": note_midi(track, string_idx, ln["fret"]),
+                        "beats": dist, "mi": lm, "bi": lb}
+    return None
+
+
 def harmonic_midi(track: dict[str, Any], string_idx: int, fret: int) -> int:
     """Natural harmonic pitch table (TabKit.jsx effect 60)."""
     tuning = track.get("tuning") or []

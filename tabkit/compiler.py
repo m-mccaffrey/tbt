@@ -19,6 +19,7 @@ from .model import (
     DEFAULT_TRACK_VELOCITY,
     DRUM_CHOKE_GROUPS,
     build_measure_map,
+    find_next_note,
     harmonic_midi,
     note_midi,
     playback_order,
@@ -30,6 +31,30 @@ _CC_EFFECTS = {86: 7, 80: 10, 77: 1, 69: 11, 82: 91, 67: 93}
 # note.effect codes
 FX_HARMONIC = 60
 FX_PALM_MUTE = 109
+FX_BEND = 98
+FX_SLIDE_DOWN = 47
+FX_SLIDE_UP = 92
+FX_RELEASE = 114
+FX_VIBRATO = 126
+FX_HAMMER = 104
+FX_PULL_OFF = 112
+_CHAIN_FX = (FX_BEND, FX_SLIDE_DOWN, FX_SLIDE_UP)
+
+# Pitch bends are emitted as 14-bit values against a widened bend range,
+# set via RPN 0,0 on every used channel at t=0.
+BEND_RANGE_SEMITONES = 12
+BEND_CENTER = 8192
+# Ramps are rendered as stepped bend events at this interval
+BEND_STEP_SEC = 0.015
+# Vibrato: ±35 cents square oscillation at 6 Hz for 3 s (synthVibratoNote)
+VIB_CENTS = 35
+VIB_RATE_HZ = 6.0
+VIB_DURATION = 3.0
+
+
+def bend_value(semitones: float) -> int:
+    raw = round(BEND_CENTER + semitones / BEND_RANGE_SEMITONES * 8192)
+    return max(0, min(16383, raw))
 
 
 @dataclass(frozen=True)
@@ -90,6 +115,10 @@ class _TrackState:
         # doubled/shimmer voices); ring flag per string
         self.active: dict[int, list[int]] = {}
         self.ring: set[int] = set()
+        # bend/technique state (mirrors bendState/suppressNext/hammerNext)
+        self.bend: dict[int, float] = {}      # semitone offset per string
+        self.suppress: dict[int, int] = {}    # skip N chained attacks
+        self.hammer: set[int] = set()         # next attack at 90% velocity
 
 
 def compile_song(song: dict[str, Any], solo_track: int | None = None,
@@ -119,12 +148,48 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
     any_solo = any(t.get("solo") for t in tracks)
     states = {ti: _TrackState(tracks[ti]) for ti in play_tracks}
 
+    # Last pitch-bend value emitted per channel (bends are per-channel in
+    # MIDI, per-voice in the web synth — see note on emit_bend below)
+    chan_bend: dict[int, int] = {}
+
+    def emit_bend(time: float, ch: int, semitones: float, ti: int,
+                  force: bool = False) -> None:
+        val = bend_value(semitones)
+        if force or chan_bend.get(ch, BEND_CENTER) != val:
+            chan_bend[ch] = val
+            emit(time, "bend", ch, val, track=ti)
+
+    def emit_ramp(t0: float, semi0: float, t1: float, semi1: float,
+                  ch: int, ti: int) -> None:
+        """Linear pitch ramp as stepped bend events (synthChainRamp)."""
+        span = max(t1 - t0, 0.05)
+        steps = max(2, min(200, int(span / BEND_STEP_SEC)))
+        for i in range(1, steps + 1):
+            frac = i / steps
+            emit_bend(t0 + span * frac, ch, semi0 + (semi1 - semi0) * frac, ti)
+
+    def emit_vibrato(t0: float, center_semi: float, ch: int, ti: int) -> None:
+        """±35-cent square oscillation at 6 Hz (synthVibratoNote)."""
+        cycles = round(VIB_DURATION * VIB_RATE_HZ)
+        offset = VIB_CENTS / 100.0
+        for vi in range(cycles):
+            emit_bend(t0 + vi / VIB_RATE_HZ, ch, center_semi + offset, ti)
+            emit_bend(t0 + vi / VIB_RATE_HZ + 0.5 / VIB_RATE_HZ, ch,
+                      center_semi - offset, ti)
+        emit_bend(t0 + cycles / VIB_RATE_HZ, ch, center_semi, ti)
+
     # Initial channel setup
     for ti in play_tracks:
         trk = tracks[ti]
         st = states[ti]
         ch = trk.get("midiChannel", ti)
         emit(0.0, "prog", ch, st.instrument, st.bank, track=ti)
+        if not trk.get("isDrum"):
+            # RPN 0,0: widen pitch-bend range so bends/slides fit
+            emit(0.0, "cc", ch, 101, 0, track=ti)
+            emit(0.0, "cc", ch, 100, 0, track=ti)
+            emit(0.0, "cc", ch, 6, BEND_RANGE_SEMITONES, track=ti)
+            emit(0.0, "cc", ch, 38, 0, track=ti)
         if trk.get("volume") is not None:
             emit(0.0, "cc", ch, 7, max(0, min(127, trk["volume"])), track=ti)
         if trk.get("pan") is not None:
@@ -224,13 +289,81 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                             if (not n or not n.get("attack")) and ks not in st.ring:
                                 kill_string(ti, ch, ks, bt)
 
+                    def run_chain(si: int, source_midi: int, from_mi: int,
+                                  from_bi: int, start_time: float,
+                                  start_semi: float, is_bend: bool) -> None:
+                        """Bend/slide chain scan (TabKit.jsx 10064-10105):
+                        ramp through successive notes on the string,
+                        suppressing their attacks."""
+                        chain_time = start_time
+                        chain_semi = start_semi
+                        c_mi, c_bi = from_mi, from_bi
+                        for _ in range(20):
+                            nxt = find_next_note(trk, c_mi, c_bi, si)
+                            if nxt is None:
+                                break
+                            ramp_semi = nxt["midi"] - source_midi
+                            prev_time = chain_time
+                            chain_time += nxt["beats"] * spb
+                            emit_ramp(prev_time, chain_semi, chain_time,
+                                      ramp_semi, ch, ti)
+                            chain_semi = ramp_semi
+                            st.bend[si] = ramp_semi
+                            st.suppress[si] = st.suppress.get(si, 0) + 1
+                            c_mi, c_bi = nxt["mi"], nxt["bi"]
+                            c_notes = (trk["measures"][c_mi]["beats"][c_bi]
+                                       .get("notes") or [])
+                            c_n = c_notes[si] if si < len(c_notes) else None
+                            if not c_n:
+                                break
+                            if is_bend and c_n.get("effect") == FX_VIBRATO:
+                                emit_vibrato(chain_time, ramp_semi, ch, ti)
+                            if c_n.get("effect") in (FX_RELEASE, *_CHAIN_FX):
+                                continue
+                            if c_n.get("bendHold"):
+                                st.suppress[si] = 0
+                            break
+
                     for si, n in enumerate(notes):
-                        if not n or not n.get("attack"):
+                        if not n:
+                            continue
+                        if not n.get("attack"):
+                            # Technique-only markers act on the ringing note
+                            # (TabKit.jsx 9872-9944)
+                            if (not (n.get("techniqueOnly") or n.get("vibratoOnly"))
+                                    or si not in st.active or is_drum):
+                                continue
+                            active_midi = st.active[si][0]
+                            fx = n.get("effect")
+                            if fx == FX_VIBRATO and not st.suppress.get(si, 0):
+                                emit_vibrato(bt, st.bend.get(si, 0.0), ch, ti)
+                            elif fx in _CHAIN_FX:
+                                run_chain(si, active_midi, mi, wi, bt,
+                                          st.bend.get(si, 0.0), fx == FX_BEND)
+                            elif fx == FX_RELEASE and st.bend.get(si):
+                                nxt = find_next_note(trk, mi, wi, si)
+                                if nxt:
+                                    emit_ramp(bt, st.bend[si],
+                                              bt + nxt["beats"] * spb,
+                                              nxt["midi"] - active_midi, ch, ti)
+                                    st.suppress[si] = st.suppress.get(si, 0) + 1
+                                st.bend[si] = 0.0
                             continue
                         if n.get("stop"):
                             kill_string(ti, ch, si, bt)
                             continue
+                        # Suppressed: this attack is a bend/slide chain target;
+                        # the source's pitch ramp already covers it
+                        if st.suppress.get(si, 0) > 0 and not n.get("bendHold"):
+                            if n.get("ring"):
+                                st.ring.add(si)
+                            st.suppress[si] -= 1
+                            continue
+                        st.suppress[si] = 0
                         vel = n.get("vel", st.track_velocity)
+                        if si in st.hammer:
+                            vel = round(vel * 0.9)
+                            st.hammer.discard(si)
                         if n.get("muted"):
                             kill_string(ti, ch, si, bt)
                             mut_vel = round(vel * 0.4)
@@ -253,6 +386,12 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                         midi = max(0, min(127, midi))
                         play_vel = round(vel * 0.5) if is_harm else vel
                         pm_dur = beat_dur * 0.3 if n.get("effect") == FX_PALM_MUTE else 0.0
+
+                        # Bends are per-channel in MIDI: recenter before a
+                        # fresh attack if this channel has bent (per-string
+                        # channel allocation is a Phase 3 refinement)
+                        if not is_drum and ch in chan_bend:
+                            emit_bend(bt, ch, 0.0, ti, force=True)
 
                         sounding = [midi]
                         emit(bt, "on", ch, midi, max(1, min(127, play_vel)),
@@ -287,6 +426,35 @@ def compile_song(song: dict[str, Any], solo_track: int | None = None,
                             st.ring.add(si)
                         else:
                             st.ring.discard(si)
+
+                        # Pre-bend state, set before technique processing
+                        # (TabKit.jsx 10056-10059)
+                        if not is_drum and n.get("preBend") is not None:
+                            pb_from = note_midi(trk, si, n["preBend"])
+                            st.bend[si] = midi - pb_from
+
+                        # Technique playback (TabKit.jsx 10060-10131)
+                        fx = n.get("effect")
+                        if not is_drum and fx:
+                            if fx == FX_VIBRATO:
+                                emit_vibrato(bt, st.bend.get(si, 0.0), ch, ti)
+                            if fx in _CHAIN_FX:
+                                run_chain(si, midi, mi, wi, bt, 0.0,
+                                          fx == FX_BEND)
+                            if fx == FX_RELEASE and st.bend.get(si):
+                                nxt = find_next_note(trk, mi, wi, si)
+                                if nxt:
+                                    emit_ramp(bt, 0.0, bt + nxt["beats"] * spb,
+                                              nxt["midi"] - midi, ch, ti)
+                                    st.suppress[si] = st.suppress.get(si, 0) + 1
+                                st.bend[si] = 0.0
+                            if fx in (FX_HAMMER, FX_PULL_OFF):
+                                st.hammer.add(si)
+                        # Clear stale bend state on plain notes
+                        if (not n.get("bendHold") and fx not in
+                                (FX_BEND, FX_RELEASE, FX_SLIDE_DOWN, FX_SLIDE_UP)
+                                and n.get("preBend") is None):
+                            st.bend.pop(si, None)
 
             t += spb
 

@@ -22,14 +22,24 @@ Reference implementation: `legacy-web/TabKit.jsx` (line numbers below).
 - [x] CLI: `tabkit info | play | export | gui`
 - [x] GUI skeleton: open song, render all tracks as tab, play/stop, playhead
 
-## Phase 2 — editor parity
+## Phase 2 — editor parity (in progress)
 
-- [ ] Note entry/edit (cursor, fret typing, insert/delete note & bar)
-- [ ] Selection, copy/paste, undo/redo history
+- [x] Note entry/edit: cursor (click + arrows, crosses tracks), fret
+      typing with two-digit combining, delete, note preview on entry
+- [x] Insert/delete bar (Ctrl+B / Ctrl+Shift+B), across all tracks
+- [x] Undo/redo history (snapshots, 200 deep)
+- [x] New/Open/Save/Save As with dirty tracking
+- [x] Play from cursor (Shift+Space)
+- [x] Bend/slide chains (fx 98/47/92): full chain scan, target attacks
+      suppressed, linear pitch ramps as stepped MIDI bends over an
+      RPN-widened ±12-semitone range; bendHold, delayed (technique-only)
+      chains, releases (fx 114), pre-bends
+- [x] Vibrato (fx 126): ±35-cent 6 Hz oscillation, bend-offset centered
+- [x] Hammer-on/pull-off velocity reduction (fx 104/112)
+- [ ] Channel-per-string voice allocation so simultaneous bends on
+      different strings don't share one channel's pitch wheel
+- [ ] Selection, copy/paste
 - [ ] Track management (add/delete/duplicate, tuning presets, drum lanes)
-- [ ] Bends/slides/vibrato chains (JSX ~9900-10100 chain scan) via MIDI
-      pitch-bend ramps — needs channel-per-string voice allocation
-- [ ] Hammer-on velocity reduction (`hammerNext`), grace/trill effects
 - [ ] Pedal effects: delay taps, pitch shifter, tremolo, ADT (fx 201-205)
       as compiled event patterns instead of the web version's setTimeouts
 - [ ] Sections strip, count-in, metronome, practice/loop mode
